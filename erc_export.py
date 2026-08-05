@@ -65,7 +65,8 @@ def _run_cmd_with_progress(cmd, title='処理中...'):
     Windows 以外は通常の subprocess.run と同等。
     """
     if sys.platform != 'win32':
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         return _run_cmd_with_progress_impl(cmd, title)
     except Exception:
@@ -162,7 +163,8 @@ def _run_cmd_with_progress_impl(cmd, title):
     kernel32.Sleep(300)   # MessageBoxW が描画されるまで待つ (ctypes call = GIL 解放)
 
     # ERC を非同期で開始し、ポーリングループで経過秒数を更新する
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     start_time = time.time()
     hwnd_mb     = None
     hwnd_static = None
