@@ -348,7 +348,7 @@ def _pt_short(pintype):
 
 
 def format_review(source_file, components, pins_by_comp, nets, power_nets, anomalies,
-                  erc_data=None):
+                  erc_data=None, erc_cancelled=False):
     gnd_nets = {n for n in power_nets if _is_gnd(n)}
     pos_supply_nets = {n for n in power_nets if _is_positive_supply(n)}
 
@@ -392,7 +392,11 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
     lines.append('')
 
     # ERC 結果（kicad-cli が出力した JSON をそのまま埋め込む）
-    if erc_data is not None:
+    if erc_cancelled:
+        lines.append('== ERC RESULTS ==')
+        lines.append('KiCad ERC はユーザーによりキャンセルされました。')
+        lines.append('')
+    elif erc_data is not None:
         violations = erc_data.get('violations', [])
         n_err  = sum(1 for v in violations if v.get('severity') == 'error')
         n_warn = sum(1 for v in violations if v.get('severity') == 'warning')
@@ -521,17 +525,11 @@ def main():
             [kicad_cli, 'sch', 'erc', '--format', 'json', '--output', erc_out, sch_file],
             title='ERC & Export: ERC 実行中...',
         )
-        if erc_proc.returncode == -1:
+        erc_cancelled = erc_proc.returncode == -1
+        if erc_cancelled:
             _log('ERC: キャンセルされました')
-            with open(review_out, 'w', encoding='utf-8') as f:
-                f.write(f'=== AI REVIEW: {proj_name} ===\n')
-                f.write(f'source: {sch_file}\n\n')
-                f.write('ERC はキャンセルされました。\n')
-            _log(f'review:   {review_out}')
-            return
-
         erc_data = None
-        if os.path.exists(erc_out):
+        if not erc_cancelled and os.path.exists(erc_out):
             with open(erc_out, encoding='utf-8') as f:
                 erc_data = json.load(f)
             violations = erc_data.get('violations', [])
@@ -542,7 +540,7 @@ def main():
                 _log(f'  error: {v.get("description", "")}')
             for v in warnings:
                 _log(f'  warning: {v.get("description", "")}')
-        else:
+        elif not erc_cancelled:
             _log('ERC: failed to run')
             if erc_proc.stderr:
                 _log(erc_proc.stderr.strip())
@@ -553,7 +551,7 @@ def main():
         anomalies = detect_anomalies(components, pins_by_comp, power_nets)
         review_text = format_review(
             sch_file, components, pins_by_comp, nets, power_nets, anomalies,
-            erc_data=erc_data)
+            erc_data=erc_data, erc_cancelled=erc_cancelled)
         with open(review_out, 'w', encoding='utf-8') as f:
             f.write(review_text)
         n_crit = len([a for a in anomalies if a[0] == 'CRITICAL'])
