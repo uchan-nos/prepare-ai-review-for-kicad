@@ -418,10 +418,12 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
             pins = pins_by_comp.get(ref, {})
 
             def pin_num_key(item):
+                pin = item[0]
                 try:
-                    return int(item[0])
+                    return (0, int(pin), '')
                 except ValueError:
-                    return (0, item[0])
+                    # 非数値ピンは必ず数値ピンの後ろに来るようにする
+                    return (1, 0, pin)
 
             pwr_pins = sorted(
                 [(p, i) for p, i in pins.items()
