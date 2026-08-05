@@ -75,3 +75,13 @@ ERC が完了（あるいはキャンセル）すると、KiCad のプロジェ�
 GIF 動画にしましたので参考にどうぞ。
 
 ![](doc/prepare-ai-review-for-kicadの使用例.gif)
+
+## テスト
+
+リポジトリのルートディレクトリで、次のコマンドを実行します。
+
+```
+python3 -m unittest discover -v
+```
+
+標準ライブラリの `unittest` だけを使用しているため、追加のパッケージは不要です。
