@@ -350,6 +350,45 @@ def _is_gnd(net_name):
     return n in ('GND', 'AGND', 'DGND', 'PGND') or n.startswith('GND')
 
 
+_ZERO_OHM_RE = re.compile(r'^0+(?:[.,]0+)?\s*(?:R0*|OHM|Ω|R)?$', re.IGNORECASE)
+
+
+def _is_zero_ohm(value):
+    """"0" / "0R" / "0R0" / "0Ω" などのゼロオーム表記か。"""
+    return bool(_ZERO_OHM_RE.match(value.strip()))
+
+
+def _two_pin_power_anomaly(ref, value, net_a, net_b, gnd_nets):
+    """電源ネット間に入った 2 端子部品を判定し、(severity, msg) か None を返す。
+
+    デカップリングコンデンサ（電源-GND）や直列フェライト・ヒューズ（電源-電源）は
+    正常な構成なので検出しない。DC 短絡になる組み合わせだけを拾う。
+    """
+    kind = ref[:1].upper()
+
+    if net_a == net_b:
+        return ('WARNING', f'{ref}({value}) 両端が同一ネット [{net_a}]  [部品が短絡]')
+
+    a_gnd, b_gnd = net_a in gnd_nets, net_b in gnd_nets
+    to_gnd = a_gnd != b_gnd      # 片側だけ GND = 電源を GND へ落とすシャント接続
+    nets_str = f'{net_a} / {net_b}'
+
+    if to_gnd and kind in ('L', 'F'):
+        part = 'インダクタ' if kind == 'L' else 'ヒューズ'
+        return ('WARNING',
+                f'{ref}({value}) {part}が電源-GND 間 [{nets_str}]  [DC 短絡]')
+
+    if to_gnd and kind == 'R' and _is_zero_ohm(value):
+        return ('WARNING',
+                f'{ref}({value}) 0Ω 抵抗が電源-GND 間 [{nets_str}]  [DC 短絡]')
+
+    # 2 つの電源レールを直接またぐコンデンサ（GND 同士の接続は除く）
+    if not to_gnd and kind == 'C' and not (a_gnd and b_gnd):
+        return ('WARNING', f'{ref}({value}) コンデンサが 2 つの電源間 [{nets_str}]')
+
+    return None
+
+
 def detect_anomalies(components, pins_by_comp, power_nets):
     gnd_nets = {n for n in power_nets if _is_gnd(n)}
     pos_supply_nets = {n for n in power_nets if _is_positive_supply(n)}
@@ -382,10 +421,11 @@ def detect_anomalies(components, pins_by_comp, power_nets):
         if len(pins) == 2 and ref[:1].upper() in ('R', 'C', 'L', 'D', 'F'):
             pin_vals = list(pins.values())
             if all(p['net'] in power_nets for p in pin_vals):
-                nets_str = ' / '.join(p['net'] for p in pin_vals)
                 val = components.get(ref, {}).get('value', '')
-                anomalies.append(('WARNING',
-                    f'{ref}({val}) 両端が電源ネット [{nets_str}]'))
+                anomaly = _two_pin_power_anomaly(
+                    ref, val, pin_vals[0]['net'], pin_vals[1]['net'], gnd_nets)
+                if anomaly:
+                    anomalies.append(anomaly)
 
     return anomalies
 
@@ -406,6 +446,34 @@ _PINTYPE_SHORT = {
 
 def _pt_short(pintype):
     return _PINTYPE_SHORT.get(pintype, pintype[:3] if pintype else '?')
+
+
+def _erc_violations(erc_data):
+    """ERC 結果 JSON から違反リストを取り出す。
+
+    kicad-cli sch erc --format json は違反をシートごとの sheets[].violations に
+    格納する。トップレベルの violations も念のため拾う。
+    """
+    if not erc_data:
+        return []
+    violations = list(erc_data.get('violations') or [])
+    for sheet in erc_data.get('sheets') or []:
+        violations.extend(sheet.get('violations') or [])
+    return violations
+
+
+def _count_violations(erc_data):
+    """(error 数, warning 数, 除外数) を返す。除外された違反は件数に含めない。
+
+    KiCad 10.0.4 の出力には excluded フィールドが無く（included_severities で
+    kicad-cli 側が事前に絞る）、除外数は常に 0 になる。将来版や他バージョンが
+    excluded 付きで出力した場合に過大計上しないための防御。
+    """
+    violations = _erc_violations(erc_data)
+    active = [v for v in violations if not v.get('excluded')]
+    n_err  = sum(1 for v in active if v.get('severity') == 'error')
+    n_warn = sum(1 for v in active if v.get('severity') == 'warning')
+    return n_err, n_warn, len(violations) - len(active)
 
 
 def format_review(source_file, components, pins_by_comp, nets, power_nets, anomalies,
@@ -435,7 +503,10 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '',
         'セクション構成:',
         '  ANOMALIES   — ネットリスト解析による疑わしい接続の自動検出（人間のレビューが必要）',
+        '                デカップリングコンデンサ、プルダウン抵抗、直列フェライト等の',
+        '                正常な構成は意図的に検出対象外。ここに出ないことは正常の裏付けではない。',
         '  ERC RESULTS — KiCad の Electrical Rules Check（電気的規則検査）結果 JSON',
+        '                件数は全シートの合計。回路図側で除外された違反は excluded として別計上。',
         '  COMPONENTS  — コンポーネント一覧とピン接続（電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）',
         '',
@@ -459,10 +530,11 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         lines.append('KiCad ERC はユーザーによりキャンセルされました。')
         lines.append('')
     elif erc_data is not None:
-        violations = erc_data.get('violations', [])
-        n_err  = sum(1 for v in violations if v.get('severity') == 'error')
-        n_warn = sum(1 for v in violations if v.get('severity') == 'warning')
-        lines.append(f'== ERC RESULTS == ({n_err} error(s), {n_warn} warning(s))')
+        n_err, n_warn, n_excl = _count_violations(erc_data)
+        counts = f'{n_err} error(s), {n_warn} warning(s)'
+        if n_excl:
+            counts += f', {n_excl} excluded'
+        lines.append(f'== ERC RESULTS == ({counts})')
         lines.append('```json')
         lines.append(json.dumps(erc_data, ensure_ascii=False, indent=2))
         lines.append('```')
@@ -604,7 +676,7 @@ def main():
         if not erc_cancelled and os.path.exists(erc_out):
             with open(erc_out, encoding='utf-8') as f:
                 erc_data = json.load(f)
-            violations = erc_data.get('violations', [])
+            violations = [v for v in _erc_violations(erc_data) if not v.get('excluded')]
             errors   = [v for v in violations if v.get('severity') == 'error']
             warnings = [v for v in violations if v.get('severity') == 'warning']
             _log(f'ERC: {len(errors)} error(s), {len(warnings)} warning(s)')

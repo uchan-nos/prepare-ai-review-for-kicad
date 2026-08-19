@@ -103,6 +103,111 @@ class ReviewFormattingTests(unittest.TestCase):
         self.assertLess(review.index('pin10('), review.index('pinA('))
 
 
+class ErcViolationCountTests(unittest.TestCase):
+    """kicad-cli の ERC JSON は違反を sheets[].violations に入れる。"""
+
+    def _header(self, erc_data):
+        review = erc_export.format_review(
+            'board.kicad_sch', {}, {}, {}, set(), [], erc_data=erc_data)
+        for line in review.splitlines():
+            if line.startswith('== ERC RESULTS =='):
+                return line
+        self.fail('ERC RESULTS セクションが無い')
+
+    def test_counts_violations_nested_under_sheets(self):
+        erc_data = {'sheets': [
+            {'path': '/', 'violations': [
+                {'severity': 'warning', 'description': 'w1'},
+                {'severity': 'error', 'description': 'e1'},
+            ]},
+            {'path': '/sub/', 'violations': [
+                {'severity': 'warning', 'description': 'w2'},
+            ]},
+        ]}
+
+        self.assertEqual(self._header(erc_data),
+                         '== ERC RESULTS == (1 error(s), 2 warning(s))')
+
+    def test_counts_top_level_violations_too(self):
+        erc_data = {'violations': [{'severity': 'error', 'description': 'e1'}]}
+
+        self.assertEqual(self._header(erc_data),
+                         '== ERC RESULTS == (1 error(s), 0 warning(s))')
+
+    def test_excluded_violations_are_reported_separately(self):
+        erc_data = {'sheets': [{'path': '/', 'violations': [
+            {'severity': 'warning', 'description': 'w1'},
+            {'severity': 'warning', 'description': 'w2', 'excluded': True},
+        ]}]}
+
+        self.assertEqual(self._header(erc_data),
+                         '== ERC RESULTS == (0 error(s), 1 warning(s), 1 excluded)')
+
+    def test_no_violations_reports_zero(self):
+        self.assertEqual(self._header({'sheets': [{'path': '/', 'violations': []}]}),
+                         '== ERC RESULTS == (0 error(s), 0 warning(s))')
+
+
+class TwoPinPowerAnomalyTests(unittest.TestCase):
+    """電源ネット間の 2 端子部品。デカップリング等の正常な構成を誤検出しないこと。"""
+
+    POWER_NETS = {'+3V3', '+5V', 'GND', 'AGND'}
+
+    def _anomalies(self, ref, value, net_a, net_b):
+        components = {ref: {'value': value, 'libpart': ref[:1], 'sheet': '/'}}
+        pins_by_comp = {ref: {
+            '1': {'net': net_a, 'pintype': 'passive', 'pinfunction': ''},
+            '2': {'net': net_b, 'pintype': 'passive', 'pinfunction': ''},
+        }}
+        return erc_export.detect_anomalies(components, pins_by_comp, set(self.POWER_NETS))
+
+    # --- 正常な構成: 検出しない ---
+
+    def test_decoupling_capacitor_is_not_flagged(self):
+        self.assertEqual(self._anomalies('C1', '100nF', '+3V3', 'GND'), [])
+
+    def test_pulldown_resistor_is_not_flagged(self):
+        self.assertEqual(self._anomalies('R1', '10k', '+3V3', 'GND'), [])
+
+    def test_protection_diode_to_gnd_is_not_flagged(self):
+        self.assertEqual(self._anomalies('D1', 'TVS', '+5V', 'GND'), [])
+
+    def test_ferrite_bead_between_two_supplies_is_not_flagged(self):
+        self.assertEqual(self._anomalies('L1', 'BLM18', '+3V3', '+5V'), [])
+
+    def test_link_between_two_grounds_is_not_flagged(self):
+        self.assertEqual(self._anomalies('L2', 'BLM18', 'GND', 'AGND'), [])
+
+    def test_series_fuse_between_two_supplies_is_not_flagged(self):
+        self.assertEqual(self._anomalies('F1', '1A', '+5V', '+3V3'), [])
+
+    # --- 疑わしい構成: 検出する ---
+
+    def test_inductor_shorting_supply_to_gnd_is_flagged(self):
+        anomalies = self._anomalies('L1', 'BLM18', '+3V3', 'GND')
+
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0][0], 'WARNING')
+        self.assertIn('L1', anomalies[0][1])
+
+    def test_fuse_shorting_supply_to_gnd_is_flagged(self):
+        self.assertEqual(len(self._anomalies('F1', '1A', '+5V', 'GND')), 1)
+
+    def test_zero_ohm_resistor_shorting_supply_to_gnd_is_flagged(self):
+        for value in ('0', '0R', '0R0', '0Ω'):
+            with self.subTest(value=value):
+                self.assertEqual(len(self._anomalies('R9', value, '+3V3', 'GND')), 1)
+
+    def test_capacitor_bridging_two_supplies_is_flagged(self):
+        self.assertEqual(len(self._anomalies('C9', '100nF', '+3V3', '+5V')), 1)
+
+    def test_component_with_both_pins_on_same_net_is_flagged(self):
+        anomalies = self._anomalies('C1', '100nF', 'GND', 'GND')
+
+        self.assertEqual(len(anomalies), 1)
+        self.assertIn('C1', anomalies[0][1])
+
+
 class MainTests(unittest.TestCase):
     def test_cancelled_erc_still_writes_full_review(self):
         netlist = '''\
