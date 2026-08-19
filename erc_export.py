@@ -232,10 +232,18 @@ def find_kicad_cli():
 
 # ---------- ネットリスト解析 ----------
 
+def _find_field(comp, name):
+    """<comp> 直下の <fields><field name="..."> を大文字小文字を無視して探す。"""
+    for field in comp.findall('fields/field'):
+        if (field.get('name', '') or '').lower() == name.lower():
+            return (field.text or '').strip()
+    return ''
+
+
 def parse_netlist(root_elem):
     """KiCad XML ネットリストを解析して (components, pins_by_comp, nets, power_nets) を返す。
 
-    components:   ref -> {value, libpart, sheet}
+    components:   ref -> {value, libpart, sheet, manufacturer, manufacturer_pn}
     pins_by_comp: ref -> {pin -> {net, pintype, pinfunction}}
     nets:         net_name -> [{ref, pin, pintype, pinfunction}]
     power_nets:   power_out ノードを持つネット名の集合
@@ -248,7 +256,13 @@ def parse_netlist(root_elem):
         libpart = libsrc.get('part', '') if libsrc is not None else ''
         sheetpath = comp.find('sheetpath')
         sheet = sheetpath.get('names', '/') if sheetpath is not None else '/'
-        components[ref] = {'value': value, 'libpart': libpart, 'sheet': sheet}
+        components[ref] = {
+            'value': value,
+            'libpart': libpart,
+            'sheet': sheet,
+            'manufacturer': _find_field(comp, 'Manufacturer'),
+            'manufacturer_pn': _find_field(comp, 'Manufacturer PN'),
+        }
 
     pins_by_comp = {ref: {} for ref in components}
     nets = {}
@@ -381,6 +395,7 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）',
         '',
         'ピンタイプ略称: pwr=電源, in=入力, out=出力, bi=双方向, tri=3ステート, pas=パッシブ',
+        'MFR=Manufacturer フィールド, MPN=Manufacturer PN フィールド（回路図に設定がある部品のみ表示）',
         '',
     ]
 
@@ -420,7 +435,17 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
             if ref.startswith('#'):  # 電源シンボル (#PWR, #FLG 等) は省略
                 continue
             comp = components[ref]
-            lines.append(f'  {ref}  {comp["value"]}  ({comp["libpart"]})')
+            mfr    = comp.get('manufacturer', '')
+            mfr_pn = comp.get('manufacturer_pn', '')
+            mfr_str = ''
+            if mfr or mfr_pn:
+                parts = []
+                if mfr:
+                    parts.append(f'MFR: {mfr}')
+                if mfr_pn:
+                    parts.append(f'MPN: {mfr_pn}')
+                mfr_str = f'  [{", ".join(parts)}]'
+            lines.append(f'  {ref}  {comp["value"]}  ({comp["libpart"]}){mfr_str}')
             pins = pins_by_comp.get(ref, {})
 
             def pin_num_key(item):
