@@ -115,7 +115,7 @@ def _run_cmd_with_progress_impl(cmd, title):
     kernel32.GetCurrentThreadId.argtypes   = []
 
     MB_ICONINFORMATION = 0x00000040
-    MB_TOPMOST         = 0x00040000
+    MB_APPLMODAL       = 0x00000000
     MB_OKCANCEL        = 0x00000001
     IDOK               = 1
     IDCANCEL           = 2
@@ -152,7 +152,7 @@ def _run_cmd_with_progress_impl(cmd, title):
                                              None, kernel32.GetCurrentThreadId())
 
         retval = user32.MessageBoxW(0, _fmt(0), title,
-                                    MB_ICONINFORMATION | MB_TOPMOST | MB_OKCANCEL)
+                                    MB_ICONINFORMATION | MB_APPLMODAL | MB_OKCANCEL)
         if hook_h[0]:   # フックが発火しなかった場合のフォールバック解除
             user32.UnhookWindowsHookEx(hook_h[0])
         if retval == IDCANCEL:
