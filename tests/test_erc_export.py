@@ -27,11 +27,63 @@ class ParseNetlistTests(unittest.TestCase):
 
         self.assertEqual(
             components['U1'],
-            {'value': 'MCU', 'libpart': 'STM32', 'sheet': '/Main/'},
+            {'value': 'MCU', 'libpart': 'STM32', 'sheet': '/Main/',
+             'manufacturer': '', 'manufacturer_pn': ''},
         )
         self.assertEqual(pins_by_comp['U1']['1']['net'], '+3V3')
         self.assertEqual(nets['+3V3'][1]['pinfunction'], 'VDD')
         self.assertEqual(power_nets, {'+3V3'})
+
+    def test_parses_manufacturer_fields(self):
+        root = ET.fromstring('''\
+<export>
+  <components>
+    <comp ref="U1"><value>MCU</value>
+      <fields>
+        <field name="Manufacturer">STMicroelectronics</field>
+        <field name="Manufacturer PN">STM32F103C8T6</field>
+        <field name="Datasheet">~</field>
+      </fields>
+      <libsource part="STM32"/><sheetpath names="/"/></comp>
+  </components>
+  <nets/>
+</export>''')
+
+        components, _, _, _ = erc_export.parse_netlist(root)
+
+        self.assertEqual(components['U1']['manufacturer'], 'STMicroelectronics')
+        self.assertEqual(components['U1']['manufacturer_pn'], 'STM32F103C8T6')
+
+
+class ManufacturerFormattingTests(unittest.TestCase):
+    def _review(self, comp):
+        return erc_export.format_review(
+            'board.kicad_sch', {'U1': comp},
+            {'U1': {'1': {'net': 'SIG', 'pintype': 'input', 'pinfunction': 'IN'}}},
+            {}, set(), [],
+        )
+
+    def test_manufacturer_fields_are_listed(self):
+        review = self._review({
+            'value': 'MCU', 'libpart': 'STM32', 'sheet': '/',
+            'manufacturer': 'STMicroelectronics', 'manufacturer_pn': 'STM32F103C8T6',
+        })
+
+        self.assertIn(
+            'U1  MCU  (STM32)  [MFR: STMicroelectronics, MPN: STM32F103C8T6]', review)
+
+    def test_only_available_field_is_listed(self):
+        review = self._review({
+            'value': 'MCU', 'libpart': 'STM32', 'sheet': '/',
+            'manufacturer': '', 'manufacturer_pn': 'STM32F103C8T6',
+        })
+
+        self.assertIn('U1  MCU  (STM32)  [MPN: STM32F103C8T6]', review)
+
+    def test_no_bracket_when_fields_are_absent(self):
+        review = self._review({'value': 'MCU', 'libpart': 'STM32', 'sheet': '/'})
+
+        self.assertIn('U1  MCU  (STM32)\n', review)
 
 
 class ReviewFormattingTests(unittest.TestCase):
