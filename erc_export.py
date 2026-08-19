@@ -60,6 +60,48 @@ def _fatal(msg):
 # ERC 完了後は PostMessageW(WM_COMMAND, IDOK) でプログラム的に閉じる。
 
 
+# DPI 認識を有効にしないと、Windows がビットマップ拡大でスケーリングするため
+# (DPI 仮想化) High DPI 環境で MessageBox の文字が滲む。
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+_PROCESS_PER_MONITOR_DPI_AWARE = 2
+
+
+def _enable_dpi_awareness():
+    """プロセスを DPI 認識にする。適用したモード名を返す（適用できなければ None）。
+
+    ウィンドウを 1 つも作る前に呼ぶこと。新しい API から順に試し、
+    古い Windows では順にフォールバックする。
+    既にマニフェスト等で設定済みの場合は各 API が失敗するが、実害はない。
+    """
+    if sys.platform != 'win32':
+        return None
+
+    # Windows 10 1703 以降
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+            return 'per-monitor-v2'
+    except Exception:
+        pass
+
+    # Windows 8.1 以降（shcore.dll）
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(
+                _PROCESS_PER_MONITOR_DPI_AWARE) == 0:
+            return 'per-monitor'
+    except Exception:
+        pass
+
+    # Vista 以降（システム DPI のみ）
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return 'system'
+    except Exception:
+        pass
+
+    return None
+
+
 def _run_cmd_with_progress(cmd, title='処理中...'):
     """コマンドを実行しながら MessageBoxW で進捗を表示する。
     Windows 以外は通常の subprocess.run と同等。
@@ -81,6 +123,9 @@ def _run_cmd_with_progress(cmd, title='処理中...'):
 
 
 def _run_cmd_with_progress_impl(cmd, title):
+    # MessageBox を作る前に呼ぶ必要がある
+    _log(f'DPI awareness: {_enable_dpi_awareness() or "適用できず（既定のまま）"}')
+
     user32   = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
 
