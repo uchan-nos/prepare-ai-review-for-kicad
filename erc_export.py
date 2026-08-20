@@ -288,7 +288,7 @@ def _find_field(comp, name):
 def parse_netlist(root_elem):
     """KiCad XML ネットリストを解析して (components, pins_by_comp, nets, power_nets) を返す。
 
-    components:   ref -> {value, libpart, sheet, manufacturer, manufacturer_pn}
+    components:   ref -> {value, libpart, sheet, manufacturer, manufacturer_pn, footprint}
     pins_by_comp: ref -> {pin -> {net, pintype, pinfunction}}
     nets:         net_name -> [{ref, pin, pintype, pinfunction}]
     power_nets:   power_out ノードを持つネット名の集合
@@ -307,6 +307,7 @@ def parse_netlist(root_elem):
             'sheet': sheet,
             'manufacturer': _find_field(comp, 'Manufacturer'),
             'manufacturer_pn': _find_field(comp, 'Manufacturer PN'),
+            'footprint': (comp.findtext('footprint') or '').strip(),
         }
 
     pins_by_comp = {ref: {} for ref in components}
@@ -510,10 +511,11 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '                件数は全シートの合計。回路図側で除外された違反は excluded として別計上。',
         '                無効化されたチェックがあれば件数の直後に列挙する。',
         '  COMPONENTS  — コンポーネント一覧とピン接続（電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
+        '                Footprint / Manufacturer / Manufacturer PN は回路図に設定がある部品のみ',
+        '                1 行ずつ記載（KiCad の値をそのまま。未設定なら行ごと省略）。',
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）',
         '',
         'ピンタイプ略称: pwr=電源, in=入力, out=出力, bi=双方向, tri=3ステート, pas=パッシブ',
-        'MFR=Manufacturer フィールド, MPN=Manufacturer PN フィールド（回路図に設定がある部品のみ表示）',
         '',
     ]
 
@@ -564,17 +566,15 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
             if ref.startswith('#'):  # 電源シンボル (#PWR, #FLG 等) は省略
                 continue
             comp = components[ref]
-            mfr    = comp.get('manufacturer', '')
-            mfr_pn = comp.get('manufacturer_pn', '')
-            mfr_str = ''
-            if mfr or mfr_pn:
-                parts = []
-                if mfr:
-                    parts.append(f'MFR: {mfr}')
-                if mfr_pn:
-                    parts.append(f'MPN: {mfr_pn}')
-                mfr_str = f'  [{", ".join(parts)}]'
-            lines.append(f'  {ref}  {comp["value"]}  ({comp["libpart"]}){mfr_str}')
+            lines.append(f'  {ref}  {comp["value"]}  ({comp["libpart"]})')
+            # 属性はフィールド名をラベルにした 1 行 1 項目で出す。略称にすると
+            # 凡例を参照しないと読めず、トークンの節約分より読み手の負荷が勝る。
+            # Footprint の値は KiCad のまま（解釈・短縮・正規化はしない）。
+            for label, key in (('Footprint', 'footprint'),
+                               ('Manufacturer', 'manufacturer'),
+                               ('Manufacturer PN', 'manufacturer_pn')):
+                if comp.get(key):
+                    lines.append(f'    {label}: {comp[key]}')
             pins = pins_by_comp.get(ref, {})
 
             def pin_num_key(item):

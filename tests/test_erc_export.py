@@ -28,7 +28,7 @@ class ParseNetlistTests(unittest.TestCase):
         self.assertEqual(
             components['U1'],
             {'value': 'MCU', 'libpart': 'STM32', 'sheet': '/Main/',
-             'manufacturer': '', 'manufacturer_pn': ''},
+             'manufacturer': '', 'manufacturer_pn': '', 'footprint': ''},
         )
         self.assertEqual(pins_by_comp['U1']['1']['net'], '+3V3')
         self.assertEqual(nets['+3V3'][1]['pinfunction'], 'VDD')
@@ -63,14 +63,16 @@ class ManufacturerFormattingTests(unittest.TestCase):
             {}, set(), [],
         )
 
-    def test_manufacturer_fields_are_listed(self):
+    def test_manufacturer_fields_are_listed_on_their_own_labelled_lines(self):
+        # 略称ではなくフィールド名をそのまま出す。1 行だけ読んで意味が取れることを優先。
         review = self._review({
             'value': 'MCU', 'libpart': 'STM32', 'sheet': '/',
             'manufacturer': 'STMicroelectronics', 'manufacturer_pn': 'STM32F103C8T6',
         })
 
-        self.assertIn(
-            'U1  MCU  (STM32)  [MFR: STMicroelectronics, MPN: STM32F103C8T6]', review)
+        self.assertIn('  U1  MCU  (STM32)\n'
+                      '    Manufacturer: STMicroelectronics\n'
+                      '    Manufacturer PN: STM32F103C8T6\n', review)
 
     def test_only_available_field_is_listed(self):
         review = self._review({
@@ -78,12 +80,81 @@ class ManufacturerFormattingTests(unittest.TestCase):
             'manufacturer': '', 'manufacturer_pn': 'STM32F103C8T6',
         })
 
-        self.assertIn('U1  MCU  (STM32)  [MPN: STM32F103C8T6]', review)
+        self.assertIn('  U1  MCU  (STM32)\n'
+                      '    Manufacturer PN: STM32F103C8T6\n', review)
+        self.assertNotIn('    Manufacturer:', review)
 
-    def test_no_bracket_when_fields_are_absent(self):
+    def test_no_manufacturer_lines_when_fields_are_absent(self):
         review = self._review({'value': 'MCU', 'libpart': 'STM32', 'sheet': '/'})
 
-        self.assertIn('U1  MCU  (STM32)\n', review)
+        self.assertIn('  U1  MCU  (STM32)\n    pin1(', review)
+        self.assertNotIn('    Manufacturer', review)
+
+
+class FootprintTests(unittest.TestCase):
+    """Footprint は部品の物理的な実装形態を示すため、回路レビューにも有用。"""
+
+    FP = 'Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical'
+
+    def test_parses_footprint_element(self):
+        root = ET.fromstring(f'''\
+<export>
+  <components>
+    <comp ref="J3"><value>Conn_01x01</value>
+      <footprint>{self.FP}</footprint>
+      <libsource part="Conn_01x01"/><sheetpath names="/"/></comp>
+  </components>
+  <nets/>
+</export>''')
+
+        components, _, _, _ = erc_export.parse_netlist(root)
+
+        self.assertEqual(components['J3']['footprint'], self.FP)
+
+    def test_missing_footprint_element_yields_empty_string(self):
+        root = ET.fromstring('''\
+<export>
+  <components>
+    <comp ref="J3"><value>Conn_01x01</value>
+      <libsource part="Conn_01x01"/><sheetpath names="/"/></comp>
+  </components>
+  <nets/>
+</export>''')
+
+        components, _, _, _ = erc_export.parse_netlist(root)
+
+        self.assertEqual(components['J3']['footprint'], '')
+
+    def _review(self, **overrides):
+        comp = {'value': '22uH', 'libpart': 'L_Ferrite', 'sheet': '/',
+                'manufacturer': '', 'manufacturer_pn': '', 'footprint': ''}
+        comp.update(overrides)
+        return erc_export.format_review(
+            'board.kicad_sch', {'L1': comp},
+            {'L1': {'1': {'net': '/DCDC_IN', 'pintype': 'passive', 'pinfunction': '1_1'}}},
+            {}, set(), [])
+
+    def test_footprint_line_follows_the_component_header(self):
+        review = self._review(footprint='uchan:L_3.0x3.0mm_HandSolder',
+                              manufacturer_pn='SRN3012TA-220M')
+
+        self.assertIn('  L1  22uH  (L_Ferrite)\n'
+                      '    Footprint: uchan:L_3.0x3.0mm_HandSolder\n'
+                      '    Manufacturer PN: SRN3012TA-220M\n', review)
+
+    def test_footprint_precedes_pin_lines(self):
+        review = self._review(footprint='uchan:L_3.0x3.0mm_HandSolder')
+
+        self.assertLess(review.index('Footprint:'), review.index('pin1('))
+
+    def test_no_footprint_line_when_unset(self):
+        self.assertNotIn('Footprint:', self._review(footprint=''))
+
+    def test_footprint_string_is_emitted_verbatim(self):
+        # ツール側で解釈・短縮・正規化しない
+        odd = 'My Lib:Odd_Name-1.27mm (variant)'
+
+        self.assertIn(f'    Footprint: {odd}\n', self._review(footprint=odd))
 
 
 class ReviewFormattingTests(unittest.TestCase):
