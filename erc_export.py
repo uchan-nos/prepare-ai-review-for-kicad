@@ -311,9 +311,6 @@ def parse_netlist(root_elem):
             'lib': lib,
             'description': description,
             'sheet': sheet,
-            # Purpose は「この回路で何のために使うか」を書くカスタムフィールド。
-            # Value（何という部品か）や Footprint（何を実装するか）からは
-            # 読み取れない設計意図が入る。
             'purpose': _find_field(comp, 'Purpose'),
             'manufacturer': _find_field(comp, 'Manufacturer'),
             'manufacturer_pn': _find_field(comp, 'Manufacturer PN'),
@@ -592,10 +589,10 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '',
         '部品の属性（EXTERNAL INTERFACES と INTERNAL COMPONENTS で共通。回路図に設定が',
         'ある部品のみ 1 行ずつ記載し、未設定なら行ごと省略する。値は KiCad のものそのまま）:',
-        '  部品行の Value  — これは何という部品か',
-        '  Purpose         — この回路で何のために使うか（回路図作成者が記入した設計意図。',
+        '  部品行の Value  — 設計上の値・型名',
+        '  Purpose         — この回路での用途（回路図作成者が記入した設計意図。',
         '                    ツールは検証していないので、接続や定数と食い違わないか確認すること）',
-        '  Footprint       — 物理的に何を実装するか',
+        '  Footprint       — 物理的な実装',
         '  Manufacturer    — 部品のメーカー名',
         '  Manufacturer PN — 部品のメーカー型番',
         '',
