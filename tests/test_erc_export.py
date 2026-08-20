@@ -258,6 +258,45 @@ class TwoPinPowerAnomalyTests(unittest.TestCase):
         self.assertIn('C1', anomalies[0][1])
 
 
+class SameNetShortTests(unittest.TestCase):
+    """2 端子部品の両端が同じネットなら、その部品は短絡されていて機能しない。"""
+
+    def _anomalies(self, ref, value, net_a, net_b):
+        components = {ref: {'value': value, 'libpart': ref[:1], 'sheet': '/'}}
+        pins_by_comp = {ref: {
+            '1': {'net': net_a, 'pintype': 'passive', 'pinfunction': ''},
+            '2': {'net': net_b, 'pintype': 'passive', 'pinfunction': ''},
+        }}
+        return erc_export.detect_anomalies(components, pins_by_comp, {'+3V3', 'GND'})
+
+    def test_resistor_shorted_by_signal_net_is_flagged(self):
+        anomalies = self._anomalies('R1', '10k', 'Net-(U1-FB)', 'Net-(U1-FB)')
+
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0][0], 'WARNING')
+        self.assertIn('R1', anomalies[0][1])
+        self.assertIn('Net-(U1-FB)', anomalies[0][1])
+
+    def test_capacitor_shorted_by_signal_net_is_flagged(self):
+        self.assertEqual(len(self._anomalies('C1', '100nF', 'SIG', 'SIG')), 1)
+
+    def test_shorted_component_on_power_net_is_still_flagged(self):
+        self.assertEqual(len(self._anomalies('L1', '22uH', 'GND', 'GND')), 1)
+
+    def test_distinct_signal_nets_are_not_flagged(self):
+        self.assertEqual(self._anomalies('R1', '10k', 'SIG_A', 'SIG_B'), [])
+
+    def test_unconnected_pins_are_not_flagged(self):
+        # 未接続ピンには KiCad がピンごとに別のネット名を振るので同一にならない
+        self.assertEqual(
+            self._anomalies('R1', '10k', 'unconnected-(R1-Pad1)', 'unconnected-(R1-Pad2)'),
+            [])
+
+    def test_non_passive_two_pin_component_is_not_flagged(self):
+        # 2 ピンコネクタの両ピンが GND、のような構成は意図的でありうる
+        self.assertEqual(self._anomalies('J1', 'Conn_01x02', 'GND', 'GND'), [])
+
+
 class MainTests(unittest.TestCase):
     def test_cancelled_erc_still_writes_full_review(self):
         netlist = '''\

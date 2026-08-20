@@ -363,12 +363,9 @@ def _two_pin_power_anomaly(ref, value, net_a, net_b, gnd_nets):
 
     デカップリングコンデンサ（電源-GND）や直列フェライト・ヒューズ（電源-電源）は
     正常な構成なので検出しない。DC 短絡になる組み合わせだけを拾う。
+    net_a と net_b は異なるネットであること（同一ネットは呼び出し側で判定済み）。
     """
     kind = ref[:1].upper()
-
-    if net_a == net_b:
-        return ('WARNING', f'{ref}({value}) 両端が同一ネット [{net_a}]  [部品が短絡]')
-
     a_gnd, b_gnd = net_a in gnd_nets, net_b in gnd_nets
     to_gnd = a_gnd != b_gnd      # 片側だけ GND = 電源を GND へ落とすシャント接続
     nets_str = f'{net_a} / {net_b}'
@@ -417,13 +414,17 @@ def detect_anomalies(components, pins_by_comp, power_nets):
                 anomalies.append(('CRITICAL',
                     f'{ref} pin{pin_num} (output) → {net}  [出力が電源ネット直結]'))
 
-        # パッシブ部品の両端が電源ネット
+        # 2 端子パッシブ部品の接続チェック
         if len(pins) == 2 and ref[:1].upper() in ('R', 'C', 'L', 'D', 'F'):
             pin_vals = list(pins.values())
-            if all(p['net'] in power_nets for p in pin_vals):
-                val = components.get(ref, {}).get('value', '')
-                anomaly = _two_pin_power_anomaly(
-                    ref, val, pin_vals[0]['net'], pin_vals[1]['net'], gnd_nets)
+            net_a, net_b = pin_vals[0]['net'], pin_vals[1]['net']
+            val = components.get(ref, {}).get('value', '')
+            if net_a == net_b:
+                # 電源・信号を問わず、両端が同じネットなら部品は短絡されて機能しない
+                anomalies.append(('WARNING',
+                    f'{ref}({val}) 両端が同一ネット [{net_a}]  [部品が短絡]'))
+            elif all(p['net'] in power_nets for p in pin_vals):
+                anomaly = _two_pin_power_anomaly(ref, val, net_a, net_b, gnd_nets)
                 if anomaly:
                     anomalies.append(anomaly)
 
