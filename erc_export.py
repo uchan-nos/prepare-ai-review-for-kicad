@@ -289,7 +289,7 @@ def parse_netlist(root_elem):
     """KiCad XML ネットリストを解析して (components, pins_by_comp, nets, power_nets) を返す。
 
     components:   ref -> {value, libpart, lib, description, sheet,
-                          manufacturer, manufacturer_pn, footprint}
+                          purpose, manufacturer, manufacturer_pn, footprint}
     pins_by_comp: ref -> {pin -> {net, pintype, pinfunction}}
     nets:         net_name -> [{ref, pin, pintype, pinfunction}]
     power_nets:   power_out ノードを持つネット名の集合
@@ -311,6 +311,10 @@ def parse_netlist(root_elem):
             'lib': lib,
             'description': description,
             'sheet': sheet,
+            # Purpose は「この回路で何のために使うか」を書くカスタムフィールド。
+            # Value（何という部品か）や Footprint（何を実装するか）からは
+            # 読み取れない設計意図が入る。
+            'purpose': _find_field(comp, 'Purpose'),
             'manufacturer': _find_field(comp, 'Manufacturer'),
             'manufacturer_pn': _find_field(comp, 'Manufacturer PN'),
             'footprint': (comp.findtext('footprint') or '').strip(),
@@ -584,9 +588,16 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '                部品名を見て境界かどうかを確認すること。',
         '  INTERNAL COMPONENTS — 回路内部の部品一覧とピン接続',
         '                （電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
-        '                Footprint / Manufacturer / Manufacturer PN は回路図に設定がある部品のみ',
-        '                1 行ずつ記載（KiCad の値をそのまま。未設定なら行ごと省略）。',
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）。外部インターフェースのピンも含む',
+        '',
+        '部品の属性（EXTERNAL INTERFACES と INTERNAL COMPONENTS で共通。回路図に設定が',
+        'ある部品のみ 1 行ずつ記載し、未設定なら行ごと省略する。値は KiCad のものそのまま）:',
+        '  部品行の Value  — これは何という部品か',
+        '  Purpose         — この回路で何のために使うか（回路図作成者が記入した設計意図。',
+        '                    ツールは検証していないので、接続や定数と食い違わないか確認すること）',
+        '  Footprint       — 物理的に何を実装するか',
+        '  Manufacturer    — 部品のメーカー名',
+        '  Manufacturer PN — 部品のメーカー型番',
         '',
         'ピンタイプ略称: pwr=電源, in=入力, out=出力, bi=双方向, tri=3ステート, pas=パッシブ',
         '',
@@ -600,7 +611,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '* 計算や判断に前提条件が必要な場合は、その前提を明示してください。回路情報だけでは判断できない場合は、問題と断定せず「要確認」としてください。',
         '* 「致命的」「発注前に修正必須」などの強い判定は、回路が動作しない、部品破損や定格超過が起こる、または重大な誤動作につながる可能性が十分高い場合に限定してください。',
         '* Manufacturer PN や Datasheet など部品を特定できる情報がある場合は、それを部品選定の評価に利用してください。外部資料を確認できる場合は、できるだけメーカーのデータシートを優先してください。',
-        '* Value、Manufacturer PN、Footprint、Datasheet、ERC結果、ネット接続など、ファイルに含まれる情報を相互に関連付けて判断してください。',
+        '* Purpose が書かれている部品は、その設計意図と実際の接続・部品定数が整合しているかを確認してください。Purpose は回路図作成者が書いたものであり、正しさは保証されていません。意図が読み取れることを利用して、意図どおりに実装されているかを見てください。',
+        '* Value、Purpose、Manufacturer PN、Footprint、Datasheet、ERC結果、ネット接続など、ファイルに含まれる情報を相互に関連付けて判断してください。',
         '* ERCやANOMALIESの警告は、その存在だけで回路上の問題とは判断せず、実際の接続や設計意図を確認して評価してください。',
         '* 同じ原因から生じる複数の症状は、できるだけ一つの問題としてまとめてください。指摘件数を増やすことより、独立した問題を正確に特定することを優先してください。',
         '* 問題が見つからない箇所についても、重要な回路ブロックについて確認できたことを必要に応じて示してください。',
@@ -660,7 +672,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
                 head += f'  ({comp["libpart"]})'
             lines.append('')
             lines.append(head)
-            for label, key in (('Footprint', 'footprint'),
+            for label, key in (('Purpose', 'purpose'),
+                               ('Footprint', 'footprint'),
                                ('Manufacturer', 'manufacturer'),
                                ('Manufacturer PN', 'manufacturer_pn')):
                 if comp.get(key):
@@ -692,7 +705,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
             # 属性はフィールド名をラベルにした 1 行 1 項目で出す。略称にすると
             # 凡例を参照しないと読めず、トークンの節約分より読み手の負荷が勝る。
             # Footprint の値は KiCad のまま（解釈・短縮・正規化はしない）。
-            for label, key in (('Footprint', 'footprint'),
+            for label, key in (('Purpose', 'purpose'),
+                               ('Footprint', 'footprint'),
                                ('Manufacturer', 'manufacturer'),
                                ('Manufacturer PN', 'manufacturer_pn')):
                 if comp.get(key):

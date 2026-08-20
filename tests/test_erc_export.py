@@ -28,8 +28,8 @@ class ParseNetlistTests(unittest.TestCase):
         self.assertEqual(
             components['U1'],
             {'value': 'MCU', 'libpart': 'STM32', 'lib': '', 'description': '',
-             'sheet': '/Main/', 'manufacturer': '', 'manufacturer_pn': '',
-             'footprint': ''},
+             'sheet': '/Main/', 'purpose': '', 'manufacturer': '',
+             'manufacturer_pn': '', 'footprint': ''},
         )
         self.assertEqual(pins_by_comp['U1']['1']['net'], '+3V3')
         self.assertEqual(nets['+3V3'][1]['pinfunction'], 'VDD')
@@ -90,6 +90,85 @@ class ManufacturerFormattingTests(unittest.TestCase):
 
         self.assertIn('  U1  MCU  (STM32)\n    pin1(', review)
         self.assertNotIn('    Manufacturer', review)
+
+
+class PurposeFieldTests(unittest.TestCase):
+    """Purpose は「この回路で何のために使うか」という作成者の設計意図。
+
+    Value（何という部品か）や Footprint（何を実装するか）からは読み取れない
+    情報なので、設定されていればレビューに渡す。
+    """
+
+    PURPOSE = 'オシロスコープを当てるデバッグ端子'
+
+    def test_parses_purpose_field(self):
+        root = ET.fromstring('''\
+<export>
+  <components>
+    <comp ref="J2"><value>Conn_01x10</value>
+      <fields>
+        <field name="Purpose">オシロスコープを当てるデバッグ端子</field>
+      </fields>
+      <libsource lib="Connector_Generic" part="Conn_01x10"/>
+      <sheetpath names="/"/></comp>
+    <comp ref="R1"><value>10k</value>
+      <libsource lib="Device" part="R"/><sheetpath names="/"/></comp>
+  </components>
+  <nets/>
+</export>''')
+
+        components, _, _, _ = erc_export.parse_netlist(root)
+
+        self.assertEqual(components['J2']['purpose'], self.PURPOSE)
+        self.assertEqual(components['R1']['purpose'], '')
+
+    def _review(self, ref, comp, pins):
+        return erc_export.format_review(
+            'board.kicad_sch', {ref: comp}, {ref: pins}, {}, set(), [])
+
+    def test_purpose_of_internal_component_sits_between_value_and_footprint(self):
+        comp = {'value': 'MCU', 'libpart': 'STM32', 'lib': 'MCU_ST_STM32F1',
+                'description': '', 'sheet': '/', 'purpose': 'メイン MCU',
+                'footprint': 'Package_QFP:LQFP-48_7x7mm_P0.5mm',
+                'manufacturer': '', 'manufacturer_pn': 'STM32F103C8T6'}
+
+        review = self._review(
+            'U1', comp,
+            {'1': {'net': 'SIG', 'pintype': 'input', 'pinfunction': 'IN'}})
+
+        self.assertIn('  U1  MCU  (STM32)\n'
+                      '    Purpose: メイン MCU\n'
+                      '    Footprint: Package_QFP:LQFP-48_7x7mm_P0.5mm\n'
+                      '    Manufacturer PN: STM32F103C8T6\n', review)
+
+    def test_purpose_of_external_interface_sits_between_value_and_footprint(self):
+        comp = {'value': 'Conn_01x10', 'libpart': 'Conn_01x10',
+                'lib': 'Connector_Generic', 'description': '', 'sheet': '/',
+                'purpose': self.PURPOSE,
+                'footprint': 'Connector_PinHeader_2.54mm:'
+                             'PinHeader_1x10_P2.54mm_Vertical',
+                'manufacturer': '', 'manufacturer_pn': ''}
+
+        review = self._review(
+            'J2', comp,
+            {'1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1'}})
+
+        self.assertIn('J2  Conn_01x10\n'
+                      f'  Purpose: {self.PURPOSE}\n'
+                      '  Footprint: Connector_PinHeader_2.54mm:'
+                      'PinHeader_1x10_P2.54mm_Vertical\n'
+                      '  pin1=VBUS\n', review)
+
+    def test_no_purpose_line_when_the_field_is_unset(self):
+        comp = {'value': '10k', 'libpart': 'R', 'lib': 'Device',
+                'description': '', 'sheet': '/', 'purpose': '', 'footprint': '',
+                'manufacturer': '', 'manufacturer_pn': ''}
+
+        review = self._review(
+            'R1', comp,
+            {'1': {'net': 'SIG', 'pintype': 'passive', 'pinfunction': ''}})
+
+        self.assertNotIn('Purpose', review[review.index('== ANOMALIES =='):])
 
 
 class FootprintTests(unittest.TestCase):
