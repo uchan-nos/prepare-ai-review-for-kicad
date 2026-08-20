@@ -288,7 +288,8 @@ def _find_field(comp, name):
 def parse_netlist(root_elem):
     """KiCad XML ネットリストを解析して (components, pins_by_comp, nets, power_nets) を返す。
 
-    components:   ref -> {value, libpart, sheet, manufacturer, manufacturer_pn, footprint}
+    components:   ref -> {value, libpart, lib, description, sheet,
+                          manufacturer, manufacturer_pn, footprint}
     pins_by_comp: ref -> {pin -> {net, pintype, pinfunction}}
     nets:         net_name -> [{ref, pin, pintype, pinfunction}]
     power_nets:   power_out ノードを持つネット名の集合
@@ -298,12 +299,17 @@ def parse_netlist(root_elem):
         ref = comp.get('ref', '')
         value = comp.findtext('value') or ''
         libsrc = comp.find('libsource')
+        # lib（ライブラリ名）と description は外部インターフェースの判定に使う
         libpart = libsrc.get('part', '') if libsrc is not None else ''
+        lib = libsrc.get('lib', '') if libsrc is not None else ''
+        description = libsrc.get('description', '') if libsrc is not None else ''
         sheetpath = comp.find('sheetpath')
         sheet = sheetpath.get('names', '/') if sheetpath is not None else '/'
         components[ref] = {
             'value': value,
             'libpart': libpart,
+            'lib': lib,
+            'description': description,
             'sheet': sheet,
             'manufacturer': _find_field(comp, 'Manufacturer'),
             'manufacturer_pn': _find_field(comp, 'Manufacturer PN'),
@@ -450,6 +456,64 @@ def _pt_short(pintype):
     return _PINTYPE_SHORT.get(pintype, pintype[:3] if pintype else '?')
 
 
+def _pin_num_key(item):
+    """ピン番号順（数値ピンが先、非数値ピンは後ろ）に並べるためのキー。"""
+    pin = item[0]
+    try:
+        return (0, int(pin), '')
+    except ValueError:
+        return (1, 0, pin)
+
+
+# 外部インターフェースの判定。lib が Connector 系なら ref を問わず外部とする
+# （KiCad 公式 Connector ライブラリの中身はほぼ全部が外部境界）。カスタム
+# ライブラリは lib から判断できないため、ref が J/P/TP のものに限って部品名・
+# description のキーワードで判定し、キーワード一致の誤判定範囲を ref で絞る。
+# 誤判定しても INTERNAL COMPONENTS 側に出るだけで、情報そのものは落ちない。
+_EXTERNAL_REF_RE = re.compile(r'^(?:J|P|TP)\d')
+_CONNECTOR_LIB_RE = re.compile(r'connector', re.IGNORECASE)
+_CONNECTOR_KEYWORDS = ('conn', 'header', 'jack', 'socket', 'receptacle',
+                       'plug', 'terminal', 'testpoint', 'test point')
+
+
+def _is_external_interface(ref, comp):
+    """回路と外部との境界（コネクタ・テストポイント類）か。"""
+    if ref.startswith('#'):      # 電源シンボル (#PWR, #FLG)
+        return False
+    if _CONNECTOR_LIB_RE.search(comp.get('lib', '')):
+        return True
+    if not _EXTERNAL_REF_RE.match(ref):
+        return False
+    text = ' '.join((comp.get('libpart', ''), comp.get('value', ''),
+                     comp.get('description', ''))).lower()
+    return any(kw in text for kw in _CONNECTOR_KEYWORDS)
+
+
+# "Pin_1" / "Pad2" のようにピン番号を言い換えただけのピン名を見分ける
+_PIN_NUMBER_ALIAS_RE = re.compile(r'^(?:pin|pad|p)?[_\-\s]?0*(\d+)$', re.IGNORECASE)
+
+
+def _is_pin_number_restated(pinfunction, pin):
+    m = _PIN_NUMBER_ALIAS_RE.match(pinfunction)
+    return bool(m) and m.group(1) == pin.strip().lstrip('0')
+
+
+def _iface_pin_annotation(pin, info):
+    """外部インターフェースのピン行に付ける "(機能,型)"。情報が無ければ空。
+
+    汎用ピンヘッダは pinfunction が "Pin_1"、pintype が passive で、どちらも
+    ピン番号以上のことを言わない。そういうピンは注記を付けず pin1=NET と出す。
+    """
+    parts = []
+    pf = (info.get('pinfunction') or '').strip()
+    if pf and not _is_pin_number_restated(pf, pin):
+        parts.append(pf)
+    pintype = info.get('pintype', '')
+    if pintype not in ('', 'passive', 'unspecified'):
+        parts.append(_pt_short(pintype))
+    return f'({",".join(parts)})' if parts else ''
+
+
 def _erc_violations(erc_data):
     """ERC 結果 JSON から違反リストを取り出す。
 
@@ -510,10 +574,19 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '  ERC RESULTS — KiCad の Electrical Rules Check（電気的規則検査）結果 JSON',
         '                件数は全シートの合計。回路図側で除外された違反は excluded として別計上。',
         '                無効化されたチェックがあれば件数の直後に列挙する。',
-        '  COMPONENTS  — コンポーネント一覧とピン接続（電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
+        '  EXTERNAL INTERFACES — 回路と外部との境界（コネクタ・テストポイント類）とその接続',
+        '                ピンは番号順に並べ、電源ピンも信号ピンと同じ並びのまま記載する',
+        '                （コネクタは物理的なピン並びが本質のため）。',
+        '                ピン名がピン番号の言い換え（Pin_1 等）で pintype も passive の場合は',
+        '                注記を省いて pin1=NET と書く。',
+        '                内部部品と外部インターフェースの振り分けは Library Symbol（lib /',
+        '                part / description）と ref からの自動判定であり、誤りうる。',
+        '                部品名を見て境界かどうかを確認すること。',
+        '  INTERNAL COMPONENTS — 回路内部の部品一覧とピン接続',
+        '                （電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
         '                Footprint / Manufacturer / Manufacturer PN は回路図に設定がある部品のみ',
         '                1 行ずつ記載（KiCad の値をそのまま。未設定なら行ごと省略）。',
-        '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）',
+        '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）。外部インターフェースのピンも含む',
         '',
         'ピンタイプ略称: pwr=電源, in=入力, out=出力, bi=双方向, tri=3ステート, pas=パッシブ',
         '',
@@ -573,10 +646,40 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         lines.append('```')
         lines.append('')
 
-    # コンポーネント一覧（シート別）
-    lines.append('== COMPONENTS ==')
+    external_refs = [ref for ref in components
+                     if _is_external_interface(ref, components[ref])]
+    is_external = set(external_refs)
+
+    # 外部インターフェース（コネクタ・テストポイント類）
+    lines.append('== EXTERNAL INTERFACES == (回路と外部との境界)')
+    if external_refs:
+        for ref in sorted(external_refs, key=_ref_sort_key):
+            comp = components[ref]
+            head = f'{ref}  {comp["value"]}'
+            if comp.get('libpart') and comp['libpart'] != comp['value']:
+                head += f'  ({comp["libpart"]})'
+            lines.append('')
+            lines.append(head)
+            for label, key in (('Footprint', 'footprint'),
+                               ('Manufacturer', 'manufacturer'),
+                               ('Manufacturer PN', 'manufacturer_pn')):
+                if comp.get(key):
+                    lines.append(f'  {label}: {comp[key]}')
+            for pin, info in sorted(pins_by_comp.get(ref, {}).items(),
+                                    key=_pin_num_key):
+                annotation = _iface_pin_annotation(pin, info)
+                lines.append(
+                    f'  pin{pin}{annotation}={info["net"]}{pin_flag(info)}')
+    else:
+        lines.append('(none detected)')
+    lines.append('')
+
+    # 内部部品一覧（シート別）。外部インターフェースは専用セクションに出す
+    lines.append('== INTERNAL COMPONENTS ==')
     sheets = {}
     for ref in components:
+        if ref in is_external:
+            continue
         sheets.setdefault(components[ref]['sheet'], []).append(ref)
 
     for sheet in sorted(sheets):
@@ -596,22 +699,14 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
                     lines.append(f'    {label}: {comp[key]}')
             pins = pins_by_comp.get(ref, {})
 
-            def pin_num_key(item):
-                pin = item[0]
-                try:
-                    return (0, int(pin), '')
-                except ValueError:
-                    # 非数値ピンは必ず数値ピンの後ろに来るようにする
-                    return (1, 0, pin)
-
             pwr_pins = sorted(
                 [(p, i) for p, i in pins.items()
                  if i.get('pintype') in ('power_in', 'power_out')],
-                key=pin_num_key)
+                key=_pin_num_key)
             sig_pins = sorted(
                 [(p, i) for p, i in pins.items()
                  if i.get('pintype') not in ('power_in', 'power_out')],
-                key=pin_num_key)
+                key=_pin_num_key)
 
             if pwr_pins:
                 parts = []

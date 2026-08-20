@@ -27,8 +27,9 @@ class ParseNetlistTests(unittest.TestCase):
 
         self.assertEqual(
             components['U1'],
-            {'value': 'MCU', 'libpart': 'STM32', 'sheet': '/Main/',
-             'manufacturer': '', 'manufacturer_pn': '', 'footprint': ''},
+            {'value': 'MCU', 'libpart': 'STM32', 'lib': '', 'description': '',
+             'sheet': '/Main/', 'manufacturer': '', 'manufacturer_pn': '',
+             'footprint': ''},
         )
         self.assertEqual(pins_by_comp['U1']['1']['net'], '+3V3')
         self.assertEqual(nets['+3V3'][1]['pinfunction'], 'VDD')
@@ -368,6 +369,209 @@ class SameNetShortTests(unittest.TestCase):
         self.assertEqual(self._anomalies('J1', 'Conn_01x02', 'GND', 'GND'), [])
 
 
+class ExternalInterfaceTests(unittest.TestCase):
+    """コネクタ・テストポイントは回路と外部との境界。独立したセクションに出す。
+
+    判定は Library Symbol（lib / part / description）を主、ref を補助に使う。
+    誤判定しても INTERNAL COMPONENTS 側に出るだけで情報は落ちないが、
+    素直なコネクタが内部部品に混ざると境界のレビューが漏れる。
+    """
+
+    GROVE = {
+        'value': 'Conn_Grove_Dev', 'libpart': 'Conn_Grove_Dev', 'lib': 'uchan',
+        'description': 'Grove 4-pin connector', 'sheet': '/',
+        'footprint': 'uchan:Grove_1x04_P2mm_THT_Horizontal',
+        'manufacturer': '', 'manufacturer_pn': '',
+    }
+    GROVE_PINS = {
+        '1': {'net': 'Net-(J1-RX)', 'pintype': 'input', 'pinfunction': 'RX'},
+        '2': {'net': 'Net-(J1-TX)', 'pintype': 'output', 'pinfunction': 'TX'},
+        '3': {'net': 'VBUS', 'pintype': 'power_in', 'pinfunction': 'VCC'},
+        '4': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND'},
+    }
+    HEADER = {
+        'value': 'Conn_01x10', 'libpart': 'Conn_01x10', 'lib': 'Connector_Generic',
+        'description': 'Generic connector, single row, 01x10, script generated',
+        'sheet': '/',
+        'footprint': 'Connector_PinHeader_2.54mm:PinHeader_1x10_P2.54mm_Vertical',
+        'manufacturer': '', 'manufacturer_pn': '',
+    }
+    HEADER_PINS = {
+        '1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1'},
+        '2': {'net': '/DCDC_IN', 'pintype': 'passive', 'pinfunction': 'Pin_2'},
+        '10': {'net': '/SW', 'pintype': 'passive', 'pinfunction': 'Pin_10'},
+    }
+    RESISTOR = {
+        'value': '10k', 'libpart': 'R', 'lib': 'Device', 'description': 'Resistor',
+        'sheet': '/', 'footprint': '', 'manufacturer': '', 'manufacturer_pn': '',
+    }
+    RESISTOR_PINS = {'1': {'net': 'SIG', 'pintype': 'passive', 'pinfunction': ''}}
+
+    def _review(self, components, pins_by_comp, power_nets=('VBUS', 'GND')):
+        return erc_export.format_review(
+            'board.kicad_sch', components, pins_by_comp, {}, set(power_nets), [])
+
+    def _section(self, review, name):
+        """`== NAME ==` から次のセクション見出しまでを返す。"""
+        lines = review.splitlines()
+        start = next(i for i, l in enumerate(lines) if l.startswith(f'== {name} =='))
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i].startswith('== ')), len(lines))
+        return '\n'.join(lines[start:end])
+
+    # --- 解析 ---
+
+    def test_parses_libsource_lib_and_description(self):
+        root = ET.fromstring('''\
+<export>
+  <components>
+    <comp ref="J2"><value>Conn_01x10</value>
+      <libsource lib="Connector_Generic" part="Conn_01x10"
+                 description="Generic connector, single row, 01x10"/>
+      <sheetpath names="/"/></comp>
+  </components>
+  <nets/>
+</export>''')
+
+        components, _, _, _ = erc_export.parse_netlist(root)
+
+        self.assertEqual(components['J2']['lib'], 'Connector_Generic')
+        self.assertEqual(components['J2']['description'],
+                         'Generic connector, single row, 01x10')
+
+    # --- 出力フォーマット ---
+
+    def test_connector_lists_footprint_then_pins_in_pin_order(self):
+        review = self._review({'J1': self.GROVE}, {'J1': self.GROVE_PINS})
+
+        self.assertIn('J1  Conn_Grove_Dev\n'
+                      '  Footprint: uchan:Grove_1x04_P2mm_THT_Horizontal\n'
+                      '  pin1(RX,in)=Net-(J1-RX)\n'
+                      '  pin2(TX,out)=Net-(J1-TX)\n'
+                      '  pin3(VCC,pwr)=VBUS\n'
+                      '  pin4(GND,pwr)=GND\n', review)
+
+    def test_power_pins_are_not_grouped_apart_from_signal_pins(self):
+        # コネクタは物理的なピン並びが本質なので、電源ピンだけまとめると読めなくなる
+        review = self._review({'J1': self.GROVE}, {'J1': self.GROVE_PINS})
+
+        self.assertNotIn('PWR:', self._section(review, 'EXTERNAL INTERFACES'))
+
+    def test_pin_number_restating_pinfunction_is_omitted(self):
+        review = self._review({'J2': self.HEADER}, {'J2': self.HEADER_PINS})
+
+        self.assertIn('J2  Conn_01x10\n'
+                      '  Footprint: Connector_PinHeader_2.54mm:'
+                      'PinHeader_1x10_P2.54mm_Vertical\n'
+                      '  pin1=VBUS\n'
+                      '  pin2=/DCDC_IN\n'
+                      '  pin10=/SW\n', review)
+
+    def test_libpart_is_shown_when_it_differs_from_the_value(self):
+        comp = dict(self.HEADER, value='UART header', libpart='Conn_01x10')
+
+        review = self._review({'J2': comp}, {'J2': self.HEADER_PINS})
+
+        self.assertIn('J2  UART header  (Conn_01x10)\n', review)
+
+    def test_manufacturer_fields_are_listed(self):
+        # コネクタは INTERNAL COMPONENTS から外れるので、ここで出さないと情報が落ちる
+        comp = dict(self.GROVE, manufacturer='Seeed', manufacturer_pn='110990030')
+
+        review = self._review({'J1': comp}, {'J1': self.GROVE_PINS})
+
+        self.assertIn('  Manufacturer: Seeed\n'
+                      '  Manufacturer PN: 110990030\n', review)
+
+    def test_anomalous_power_pin_keeps_its_marker(self):
+        pins = dict(self.GROVE_PINS,
+                    **{'3': {'net': 'GND', 'pintype': 'power_in',
+                             'pinfunction': 'VCC'}})
+
+        review = self._review({'J1': self.GROVE}, {'J1': pins})
+
+        self.assertIn('  pin3(VCC,pwr)=GND !!\n', review)
+
+    def test_reports_none_when_there_is_no_external_interface(self):
+        review = self._review({'R1': self.RESISTOR}, {'R1': self.RESISTOR_PINS})
+
+        self.assertEqual(self._section(review, 'EXTERNAL INTERFACES').splitlines()[1],
+                         '(none detected)')
+
+    # --- 内部部品との切り分け ---
+
+    def test_connector_is_excluded_from_internal_components(self):
+        review = self._review({'J1': self.GROVE, 'R1': self.RESISTOR},
+                              {'J1': self.GROVE_PINS, 'R1': self.RESISTOR_PINS})
+        internal = self._section(review, 'INTERNAL COMPONENTS')
+
+        self.assertNotIn('J1', internal)
+        self.assertIn('R1  10k  (R)', internal)
+
+    def test_internal_component_is_not_listed_as_external(self):
+        review = self._review({'R1': self.RESISTOR}, {'R1': self.RESISTOR_PINS})
+
+        self.assertNotIn('R1', self._section(review, 'EXTERNAL INTERFACES'))
+
+    def test_components_section_is_renamed_to_internal_components(self):
+        review = self._review({'R1': self.RESISTOR}, {'R1': self.RESISTOR_PINS})
+
+        self.assertIn('== INTERNAL COMPONENTS ==', review)
+        self.assertNotIn('== COMPONENTS ==', review)
+
+    def test_sections_run_external_then_internal_then_signal_nets(self):
+        # 外部との境界を先に読ませる構成の方がレビューが速い
+        review = self._review({'J1': self.GROVE, 'R1': self.RESISTOR},
+                              {'J1': self.GROVE_PINS, 'R1': self.RESISTOR_PINS})
+
+        self.assertLess(review.index('== EXTERNAL INTERFACES =='),
+                        review.index('== INTERNAL COMPONENTS =='))
+        self.assertLess(review.index('== INTERNAL COMPONENTS =='),
+                        review.index('== SIGNAL NETS =='))
+
+    # --- 判定 ---
+
+    def test_connector_library_is_external_whatever_the_reference_is(self):
+        comp = dict(self.HEADER, lib='Connector', libpart='USB_C_Receptacle',
+                    value='USB_C_Receptacle', description='USB Type-C receptacle')
+
+        review = self._review({'USB1': comp}, {'USB1': self.HEADER_PINS})
+
+        self.assertIn('USB1  USB_C_Receptacle\n',
+                      self._section(review, 'EXTERNAL INTERFACES'))
+
+    def test_custom_library_connector_is_detected_by_symbol_name(self):
+        review = self._review({'J1': self.GROVE}, {'J1': self.GROVE_PINS})
+
+        self.assertIn('J1  Conn_Grove_Dev\n',
+                      self._section(review, 'EXTERNAL INTERFACES'))
+
+    def test_test_point_is_external(self):
+        comp = dict(self.RESISTOR, lib='uchan', libpart='TestPoint',
+                    value='TestPoint', description='test point')
+
+        review = self._review({'TP1': comp}, {'TP1': self.RESISTOR_PINS})
+
+        self.assertIn('TP1  TestPoint\n',
+                      self._section(review, 'EXTERNAL INTERFACES'))
+
+    def test_connector_shaped_reference_alone_is_not_enough(self):
+        # J9 に割り当てられた抵抗を境界として扱ってはならない
+        review = self._review({'J9': self.RESISTOR}, {'J9': self.RESISTOR_PINS})
+
+        self.assertNotIn('J9', self._section(review, 'EXTERNAL INTERFACES'))
+        self.assertIn('J9  10k  (R)', self._section(review, 'INTERNAL COMPONENTS'))
+
+    def test_solder_jumper_is_not_external(self):
+        # JP1 のようなジャンパは外部との境界ではない
+        comp = dict(self.RESISTOR, lib='Jumper', libpart='SolderJumper_2_Open',
+                    value='SolderJumper_2_Open', description='solder jumper, 2 pads')
+
+        review = self._review({'JP1': comp}, {'JP1': self.RESISTOR_PINS})
+
+        self.assertNotIn('JP1', self._section(review, 'EXTERNAL INTERFACES'))
+
+
 class MainTests(unittest.TestCase):
     def test_cancelled_erc_still_writes_full_review(self):
         netlist = '''\
@@ -403,7 +607,7 @@ class MainTests(unittest.TestCase):
             self.assertEqual(len(reviews), 1)
             review = reviews[0].read_text(encoding='utf-8')
             self.assertIn('KiCad ERC はユーザーによりキャンセルされました。', review)
-            self.assertIn('== COMPONENTS ==', review)
+            self.assertIn('== INTERNAL COMPONENTS ==', review)
             self.assertIn('R1  10k  (R)', review)
             self.assertIn('== SIGNAL NETS ==', review)
 
