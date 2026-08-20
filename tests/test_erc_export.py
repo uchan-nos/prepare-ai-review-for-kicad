@@ -448,6 +448,23 @@ class SameNetShortTests(unittest.TestCase):
         self.assertEqual(self._anomalies('J1', 'Conn_01x02', 'GND', 'GND'), [])
 
 
+class HeaderLineWrapTests(unittest.TestCase):
+    """説明文は 1 センテンス（1 段落）を論理 1 行で書く。
+
+    折り返しのための改行と、継続行の深いインデントは何の情報も持たないので、
+    トークンを無駄にするだけ。部品・ピン行の 2/4 スペースは階層を表すので別。
+    """
+
+    def test_header_has_no_wrap_continuation_lines(self):
+        review = erc_export.format_review(
+            'board.kicad_sch', {}, {}, {}, set(), [])
+        header = review[:review.index('== ANOMALIES ==')]
+
+        wrapped = [l for l in header.splitlines() if l.startswith('      ')]
+
+        self.assertEqual(wrapped, [])
+
+
 class ExternalInterfaceTests(unittest.TestCase):
     """コネクタ・テストポイントは回路と外部との境界。独立したセクションに出す。
 
