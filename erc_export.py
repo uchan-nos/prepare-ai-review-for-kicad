@@ -345,6 +345,80 @@ def parse_netlist(root_elem):
     return components, pins_by_comp, nets, power_nets
 
 
+# ---------- 設計メモ（回路図テキスト）の抽出 ----------
+#
+# 中間ネットリストに回路図のテキストは入らないので .kicad_sch を直接読む。
+# 見出しの無いテキストは拾わない。位置で近くの部品に紐づく注記であり、
+# 位置を落として並べると、どの部品の話か分からないまま AI に渡ってしまう。
+
+_DESIGN_NOTE_HEADINGS = ('design notes', '設計メモ', '設計ノート')
+
+# 見出しの直後はコロン（半角・全角）か改行。「設計メモは別紙」のような
+# 通常の文を見出しと誤認しないための条件。
+_NOTE_HEADING_END_RE = re.compile(r'[ \t]*[:：][ \t]*|[ \t]*\n')
+
+# .kicad_sch のテキスト要素。text は素のテキスト、text_box は枠付きテキスト
+_SCH_TEXT_RE = re.compile(r'\((?:text|text_box)\s+"((?:[^"\\]|\\.)*)"')
+
+_SCH_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r'}
+
+
+def _unescape_sch_string(text):
+    """.kicad_sch の文字列リテラルのエスケープを戻す（改行は \n で格納される）。"""
+    return re.sub(r'\\(.)', lambda m: _SCH_ESCAPES.get(m.group(1), m.group(1)), text)
+
+
+def _design_note_body(text):
+    """設計メモなら見出しを除いた本文を返す。設計メモでなければ None。"""
+    text = text.lstrip()
+    lowered = text.lower()
+    for heading in _DESIGN_NOTE_HEADINGS:
+        if not lowered.startswith(heading):
+            continue
+        rest = text[len(heading):]
+        end = _NOTE_HEADING_END_RE.match(rest)
+        if end:
+            return rest[end.end():].strip() or None
+    return None
+
+
+def parse_design_notes(sch_text):
+    """.kicad_sch の内容から設計メモの本文を、書かれている順に返す。"""
+    notes = []
+    for raw in _SCH_TEXT_RE.findall(sch_text):
+        body = _design_note_body(_unescape_sch_string(raw))
+        if body:
+            notes.append(body)
+    return notes
+
+
+def read_design_notes(root_elem, sch_file, on_error=None):
+    """回路図ファイル（サブシート含む）から設計メモを集める。
+
+    サブシートのファイル名は中間ネットリストの design/sheet に入っている。
+    読めなかったファイルは on_error(path, exc) で報告する。報告しないと、
+    「回路図に見出しを書き忘れた」と「回路図を読めなかった」が
+    どちらも 0 件になり、書いたはずのメモが消えたことに気づけない。
+    """
+    proj_dir = os.path.dirname(sch_file)
+    paths = [sch_file]
+    for sheet in root_elem.findall('design/sheet'):
+        name = (sheet.findtext('title_block/source') or '').strip()
+        path = os.path.join(proj_dir, name) if name else ''
+        if path and path not in paths:
+            paths.append(path)
+
+    notes = []
+    for path in paths:
+        try:
+            with open(path, encoding='utf-8') as f:
+                notes.extend(parse_design_notes(f.read()))
+        except OSError as exc:
+            if on_error:
+                on_error(path, exc)
+    return notes
+
+
 # ---------- 異常検出 ----------
 
 def _is_positive_supply(net_name):
@@ -567,7 +641,7 @@ def _count_violations(erc_data):
 
 
 def format_review(source_file, components, pins_by_comp, nets, power_nets, anomalies,
-                  erc_data=None, erc_cancelled=False):
+                  erc_data=None, erc_cancelled=False, design_notes=None):
     gnd_nets = {n for n in power_nets if _is_gnd(n)}
     pos_supply_nets = {n for n in power_nets if _is_positive_supply(n)}
 
@@ -592,6 +666,7 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         'AI による回路チェックを目的として、ネットリストと ERC 結果を 1 ファイルにまとめています。',
         '',
         'セクション構成:',
+        '  DESIGN NOTES — 回路図にテキストで書かれた設計メモ（"設計メモ:" や "Design Notes:" で始まるテキスト）。回路全体にかかる前提や、部品単位の Purpose に書くには長い記述が入る。回路図作成者が書いた設計意図であり、ツールは検証していない。該当するテキストが無ければこのセクションは出ない。',
         '  ANOMALIES — ネットリスト解析による疑わしい接続の自動検出（人間のレビューが必要）。デカップリングコンデンサ、プルダウン抵抗、直列フェライト等の正常な構成は意図的に検出対象外。ここに出ないことは正常の裏付けではない。',
         '  ERC RESULTS — KiCad の Electrical Rules Check（電気的規則検査）結果 JSON。件数は全シートの合計。回路図側で除外された違反は excluded として別計上。無効化されたチェックがあれば件数の直後に列挙する。',
         '  EXTERNAL INTERFACES — 回路と外部との境界（コネクタ・テストポイント類）とその接続。ピンは番号順に並べ、電源ピンも信号ピンと同じ並びのまま記載する（コネクタは物理的なピン並びが本質のため）。内部部品と外部インターフェースの振り分けは Library Symbol（lib / part / description）と ref からの自動判定であり、誤りうる。部品名を見て境界かどうかを確認すること。',
@@ -620,7 +695,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '* 計算や判断に前提条件が必要な場合は、その前提を明示してください。回路情報だけでは判断できない場合は、問題と断定せず「要確認」としてください。',
         '* 「致命的」「発注前に修正必須」などの強い判定は、回路が動作しない、部品破損や定格超過が起こる、または重大な誤動作につながる可能性が十分高い場合に限定してください。',
         '* Manufacturer PN や Datasheet など部品を特定できる情報がある場合は、それを部品選定の評価に利用してください。外部資料を確認できる場合は、できるだけメーカーのデータシートを優先してください。',
-        '* Purpose が書かれている部品は、その設計意図と実際の接続・部品定数が整合しているかを確認してください。Purpose は回路図作成者が書いたものであり、正しさは保証されていません。意図が読み取れることを利用して、意図どおりに実装されているかを見てください。',
+        '* DESIGN NOTES と Purpose は回路図作成者が書いた設計意図です。まずこれらを読んで設計の前提を把握し、そのうえで実際の接続・部品定数が意図と整合しているかを確認してください。',
+        '* Purpose が書かれている部品は、その設計意図と実際の接続・部品定数が整合しているかを確認しています。Purpose は回路図作成者が書いたものであり、正しさは保証されていません。意図が読み取れることを利用して、意図どおりに実装されているかを見てください。',
         '* Value、Purpose、Manufacturer PN、Footprint、Datasheet、ERC結果、ネット接続など、ファイルに含まれる情報を相互に関連付けて判断してください。',
         '* ERCやANOMALIESの警告は、その存在だけで回路上の問題とは判断せず、実際の接続や設計意図を確認して評価してください。',
         '* 同じ原因から生じる複数の症状は、できるだけ一つの問題としてまとめてください。指摘件数を増やすことより、独立した問題を正確に特定することを優先してください。',
@@ -631,6 +707,12 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         'レビューでは、重大な問題、要確認事項、改善提案を区別し、それぞれについて「なぜ問題なのか」と「どの程度の確度でそう判断したか」が分かるようにしてください。',
         '',
     ]
+
+    # 設計メモ（回路図に書かれていなければセクションごと出さない）
+    if design_notes:
+        lines.append('== DESIGN NOTES ==')
+        lines.append('\n\n'.join(design_notes))
+        lines.append('')
 
     # 異常一覧
     lines.append('== ANOMALIES ==')
@@ -842,15 +924,22 @@ def main():
         _log('generating review...')
         components, pins_by_comp, nets, power_nets = parse_netlist(root_elem)
         anomalies = detect_anomalies(components, pins_by_comp, power_nets)
+        design_notes = read_design_notes(
+            root_elem, sch_file,
+            on_error=lambda path, exc: _log(f'warning: 回路図を読めません: {path} ({exc})'))
         review_text = format_review(
             sch_file, components, pins_by_comp, nets, power_nets, anomalies,
-            erc_data=erc_data, erc_cancelled=erc_cancelled)
+            erc_data=erc_data, erc_cancelled=erc_cancelled,
+            design_notes=design_notes)
         with open(review_out, 'w', encoding='utf-8') as f:
             f.write(review_text)
         n_crit = len([a for a in anomalies if a[0] == 'CRITICAL'])
         n_warn = len([a for a in anomalies if a[0] == 'WARNING'])
         _log(f'review:   {review_out}')
         _log(f'anomalies: {n_crit} critical, {n_warn} warning')
+        # 見出しの付け忘れや、回路図を保存せずにエクスポートした場合に気づけるよう
+        # 件数を出す（0 件なら回路図側の見出しを疑う）
+        _log(f'design notes: {len(design_notes)} block(s)')
         _log('done')
 
     finally:

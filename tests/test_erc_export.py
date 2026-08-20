@@ -817,7 +817,191 @@ class ExternalInterfaceTests(unittest.TestCase):
         self.assertNotIn('JP1', self._section(review, 'EXTERNAL INTERFACES'))
 
 
+class DesignNotesParseTests(unittest.TestCase):
+    """回路図テキストの設計メモ。部品単位の Purpose では長すぎる記述や、
+    回路全体にかかる前提を書くためのもの。
+
+    見出しは "Design Notes" / "設計メモ" / "設計ノート" のいずれかで、
+    直後はコロン（半角・全角）か改行。見出しの無いテキストは拾わない
+    （位置で部品に紐づく注記なので、位置を落として並べても意味を成さない）。
+    """
+
+    def test_text_box_with_a_heading_line(self):
+        # 実データの形。KiCad は改行を \\n でエスケープして 1 行に格納する
+        sch = ('(text_box "設計メモ\\nJ1 RX/TXはFPGAの3.3V IOと接続'
+               '\\nJ1 VCCの想定範囲は4.5-5.5V"\n\t(at 31.75 86.36 0)\n)')
+
+        self.assertEqual(
+            erc_export.parse_design_notes(sch),
+            ['J1 RX/TXはFPGAの3.3V IOと接続\nJ1 VCCの想定範囲は4.5-5.5V'])
+
+    def test_plain_text_element_is_also_read(self):
+        sch = '(text "設計メモ\\n全体は3.3V系"\n\t(at 10 10 0)\n)'
+
+        self.assertEqual(erc_export.parse_design_notes(sch), ['全体は3.3V系'])
+
+    def test_accepts_every_heading_and_colon_form(self):
+        for heading in ('Design Notes:', 'design notes:', 'DESIGN NOTES：',
+                        '設計メモ:', '設計メモ：', '設計ノート:', '設計ノート：',
+                        'Design Notes\\n', '設計メモ\\n', '設計ノート\\n'):
+            with self.subTest(heading=heading):
+                sch = f'(text_box "{heading}全体は3.3V系"\n)'
+
+                self.assertEqual(erc_export.parse_design_notes(sch),
+                                 ['全体は3.3V系'])
+
+    def test_text_without_a_heading_is_ignored(self):
+        sch = '(text "1uFでも可"\n)\n(text "RX/TXはホスト基準"\n)'
+
+        self.assertEqual(erc_export.parse_design_notes(sch), [])
+
+    def test_heading_word_must_be_followed_by_a_colon_or_newline(self):
+        # 「設計メモは…」のような通常の文は見出しではない
+        sch = '(text "設計メモは別紙にある"\n)'
+
+        self.assertEqual(erc_export.parse_design_notes(sch), [])
+
+    def test_empty_note_is_ignored(self):
+        sch = '(text_box "設計メモ:"\n)\n(text_box "設計メモ\\n   "\n)'
+
+        self.assertEqual(erc_export.parse_design_notes(sch), [])
+
+    def test_multiple_notes_keep_their_order(self):
+        sch = ('(text_box "設計メモ\\n1つ目"\n)\n'
+               '(text "Design Notes: 2つ目"\n)')
+
+        self.assertEqual(erc_export.parse_design_notes(sch), ['1つ目', '2つ目'])
+
+    def test_escaped_quotes_and_backslashes_are_restored(self):
+        sch = '(text_box "設計メモ\\nU1の\\"EN\\"はH固定 C:\\\\\\\\doc参照"\n)'
+
+        self.assertEqual(erc_export.parse_design_notes(sch),
+                         ['U1の"EN"はH固定 C:\\\\doc参照'])
+
+
+class DesignNotesSourceTests(unittest.TestCase):
+    """回路図ファイルが読めなかったとき、メモは黙って 0 件にならないこと。
+
+    読めない原因（パスのずれ、権限）は回路図側の書き忘れと区別できない。
+    区別できないまま 0 件になると、書いたはずのメモが消えたことに気づけない。
+    """
+
+    NETLIST = """<export>
+  <design><source>{sch}</source>
+    <sheet number="1" name="/"><title_block><source>root.kicad_sch</source>
+      </title_block></sheet>
+    <sheet number="2" name="/sub/"><title_block><source>sub.kicad_sch</source>
+      </title_block></sheet>
+  </design>
+</export>"""
+
+    def test_reads_notes_from_every_sheet_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            (tmp_path / 'root.kicad_sch').write_text(
+                '(text_box "設計メモ\\n親シートのメモ")', encoding='utf-8')
+            (tmp_path / 'sub.kicad_sch').write_text(
+                '(text_box "設計メモ\\n子シートのメモ")', encoding='utf-8')
+            root = ET.fromstring(
+                self.NETLIST.format(sch=tmp_path / 'root.kicad_sch'))
+
+            notes = erc_export.read_design_notes(
+                root, str(tmp_path / 'root.kicad_sch'))
+
+        self.assertEqual(notes, ['親シートのメモ', '子シートのメモ'])
+
+    def test_unreadable_sheet_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            root = ET.fromstring(
+                self.NETLIST.format(sch=tmp_path / 'root.kicad_sch'))
+            failed = []
+
+            notes = erc_export.read_design_notes(
+                root, str(tmp_path / 'root.kicad_sch'),
+                on_error=lambda path, exc: failed.append(path))
+
+        self.assertEqual(notes, [])
+        self.assertEqual(len(failed), 2)
+        self.assertTrue(failed[0].endswith('root.kicad_sch'))
+
+
+class DesignNotesFormattingTests(unittest.TestCase):
+    NOTES = ['J1 RX/TXはFPGAの3.3V IOと接続\nJ1 VCCの想定範囲は4.5-5.5V']
+
+    def _review(self, notes):
+        return erc_export.format_review(
+            'board.kicad_sch', {}, {}, {}, set(), [], design_notes=notes)
+
+    def test_notes_are_written_verbatim_line_by_line(self):
+        review = self._review(self.NOTES)
+
+        self.assertIn('== DESIGN NOTES ==\n'
+                      'J1 RX/TXはFPGAの3.3V IOと接続\n'
+                      'J1 VCCの想定範囲は4.5-5.5V\n', review)
+
+    def test_notes_come_before_the_generated_data(self):
+        # 人間が書いた唯一の記述なので、機械生成データより先に読ませる
+        review = self._review(self.NOTES)
+
+        self.assertLess(review.index('== DESIGN NOTES =='),
+                        review.index('== ANOMALIES =='))
+
+    def test_blocks_are_separated_by_a_blank_line(self):
+        review = self._review(['1つ目', '2つ目'])
+
+        self.assertIn('== DESIGN NOTES ==\n1つ目\n\n2つ目\n', review)
+
+    def test_section_is_absent_when_there_are_no_notes(self):
+        # 凡例はセクションの説明を常に持つので、見出しの有無で判定する
+        for notes in (None, []):
+            with self.subTest(notes=notes):
+                self.assertNotIn('== DESIGN NOTES ==', self._review(notes))
+
+
 class MainTests(unittest.TestCase):
+    def test_design_note_in_the_schematic_reaches_the_review(self):
+        """回路図テキスト → review.txt の経路。ここが切れるとメモが黙って消える。"""
+        netlist = """<export>
+  <design><source>{source}</source>
+    <sheet number="1" name="/"><title_block><source>board.kicad_sch</source>
+      </title_block></sheet>
+  </design>
+  <components>
+    <comp ref="R1"><value>10k</value><libsource lib="Device" part="R"/>
+      <sheetpath names="/"/></comp>
+  </components>
+  <nets><net name="SIG"><node ref="R1" pin="1" pintype="passive"/></net></nets>
+</export>"""
+        sch = ('(kicad_sch\n'
+               '\t(text_box "設計メモ\\nJ1 VCCの想定範囲は4.5-5.5V"\n\t\t(at 1 2 0)\n\t)\n'
+               '\t(text "1uFでも可"\n\t\t(at 3 4 0)\n\t)\n)')
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            source = tmp_path / 'board.kicad_sch'
+            source.write_text(sch, encoding='utf-8')
+            input_net = tmp_path / 'input.net'
+            input_net.write_text(netlist.format(source=source), encoding='utf-8')
+
+            with (
+                mock.patch.object(erc_export, '_FALLBACK_LOG', str(tmp_path / 'error.log')),
+                mock.patch.object(erc_export, 'find_kicad_cli', return_value='kicad-cli'),
+                mock.patch.object(
+                    erc_export, '_run_cmd_with_progress',
+                    return_value=subprocess.CompletedProcess([], -1, None, 'cancelled'),
+                ),
+                mock.patch.object(sys, 'argv',
+                                  ['erc_export.py', '--review-only', str(input_net)]),
+            ):
+                erc_export.main()
+
+            review = next((tmp_path / 'ai-review').glob('*.review.txt')).read_text(
+                encoding='utf-8')
+
+        self.assertIn('== DESIGN NOTES ==\nJ1 VCCの想定範囲は4.5-5.5V\n', review)
+        self.assertNotIn('1uFでも可', review)
+
     def test_cancelled_erc_still_writes_full_review(self):
         netlist = '''\
 <export>
