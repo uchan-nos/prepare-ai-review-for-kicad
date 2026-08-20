@@ -92,6 +92,141 @@ class ManufacturerFormattingTests(unittest.TestCase):
         self.assertNotIn('    Manufacturer', review)
 
 
+class PinNumberSuffixTests(unittest.TestCase):
+    """KiCad 10 のネットリストは pinfunction を「ピン名_ピン番号」で出す。
+
+    行頭に pinN があるので末尾の _N は情報を持たない。実データでは名前付きの
+    全ピン行（PWR: pin2(GND_2)→GND、pin1(SW_1,out)=... など）に現れるため、
+    落とさないとレビューファイル全体に冗長な文字が散る。
+    """
+
+    def _review(self, pins):
+        comp = {'value': 'DCDC', 'libpart': 'AP3012', 'lib': 'Regulator_Switching',
+                'description': '', 'sheet': '/', 'purpose': '', 'footprint': '',
+                'manufacturer': '', 'manufacturer_pn': ''}
+        return erc_export.format_review(
+            'board.kicad_sch', {'U1': comp}, {'U1': pins}, {}, {'GND'}, [])
+
+    def test_signal_pin_line_drops_the_redundant_pin_number(self):
+        review = self._review(
+            {'1': {'net': '/SW', 'pintype': 'output', 'pinfunction': 'SW_1'}})
+
+        self.assertIn('    pin1(SW,out)=/SW\n', review)
+
+    def test_power_pin_line_drops_the_redundant_pin_number(self):
+        review = self._review(
+            {'2': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND_2'}})
+
+        self.assertIn('    pin2(GND,pwr)=GND\n', review)
+
+    def test_suffix_matching_another_pin_number_is_kept(self):
+        # pin7 の "FB_3" の _3 は 7 番ピンの番号ではなく名前の一部なので残す
+        review = self._review(
+            {'7': {'net': 'Net-(U1-FB)', 'pintype': 'input', 'pinfunction': 'FB_3'}})
+
+        self.assertIn('    pin7(FB_3,in)=Net-(U1-FB)\n', review)
+
+    def test_name_without_suffix_is_untouched(self):
+        review = self._review(
+            {'1': {'net': '/SW', 'pintype': 'output', 'pinfunction': 'SW'}})
+
+        self.assertIn('    pin1(SW,out)=/SW\n', review)
+
+
+class InternalPinAnnotationTests(unittest.TestCase):
+    """注記の省略規則は内部部品にも同じく適用する。
+
+    括弧の有無が情報の有無と一致することが狙い。括弧が無いピンは
+    「名前も型も語ることが無い」ことを意味し、型が書かれていないピンは
+    passive（または unspecified）だと読み手が復元できる。
+    """
+
+    def _review(self, pins, value='10k', libpart='R'):
+        comp = {'value': value, 'libpart': libpart, 'lib': 'Device',
+                'description': '', 'sheet': '/', 'purpose': '', 'footprint': '',
+                'manufacturer': '', 'manufacturer_pn': ''}
+        return erc_export.format_review(
+            'board.kicad_sch', {'X1': comp}, {'X1': pins}, {}, {'GND'}, [])
+
+    def test_nameless_passive_pin_drops_the_whole_annotation(self):
+        review = self._review(
+            {'1': {'net': 'SIG', 'pintype': 'passive', 'pinfunction': ''}})
+        # 凡例にも pin1(...) の例文があるので、部品一覧の中だけを見る
+        section = review[review.index('== INTERNAL COMPONENTS =='):]
+
+        self.assertIn('    pin1=SIG\n', section)
+        self.assertNotIn('pin1(', section)
+
+    def test_pin_named_after_its_number_drops_the_whole_annotation(self):
+        # 実データのフェライトビード: pinfunction="1_1" / "2_2"
+        review = self._review(
+            {'1': {'net': '/DCDC_IN', 'pintype': 'passive', 'pinfunction': '1_1'},
+             '2': {'net': '/SW', 'pintype': 'passive', 'pinfunction': '2_2'}},
+            value='22uH', libpart='L')
+
+        self.assertIn('    pin1=/DCDC_IN\n    pin2=/SW\n', review)
+
+    def test_parens_always_carry_both_name_and_type(self):
+        # ダイオードの K / A は役割を語るので括弧を出す。片方だけの (K) は作らない
+        review = self._review(
+            {'1': {'net': '/DCDC_OUT', 'pintype': 'passive', 'pinfunction': 'K_1'},
+             '2': {'net': '/SW', 'pintype': 'passive', 'pinfunction': 'A_2'}},
+            value='B5819W', libpart='D_Schottky')
+
+        self.assertIn('    pin1(K,pas)=/DCDC_OUT\n    pin2(A,pas)=/SW\n', review)
+
+    def test_nameless_pin_with_a_meaningful_type_leaves_the_name_slot_empty(self):
+        # 括弧の項目数は変えない。名前の欄が空であること自体が「名前が無い」の意
+        review = self._review(
+            {'1': {'net': 'SIG', 'pintype': 'input', 'pinfunction': 'Pin_1_1'}})
+
+        self.assertIn('    pin1(,in)=SIG\n', review)
+
+    def test_informative_pintype_is_still_shown(self):
+        review = self._review(
+            {'3': {'net': 'Net-(U1-FB)', 'pintype': 'input', 'pinfunction': 'FB_3'}},
+            value='AP3012', libpart='AP3012')
+
+        self.assertIn('    pin3(FB,in)=Net-(U1-FB)\n', review)
+
+    def test_power_pins_are_plain_pin_lines(self):
+        # 電源ピンだけの別書式（PWR: 行）は持たない。pwr と書いてあれば足りる
+        review = self._review(
+            {'1': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': ''},
+             '2': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND_2'}})
+
+        self.assertIn('    pin1(,pwr)=GND\n    pin2(GND,pwr)=GND\n', review)
+        self.assertNotIn('PWR:', review)
+
+    def test_nothing_is_marked_as_verified(self):
+        """✓ は「検査して正常」を主張するが、チェックはその裏付けほど深くない。
+
+        印が無い = 何も検出されていない、という読み方に統一する。
+        """
+        review = self._review(
+            {'1': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND_1'}})
+
+        self.assertNotIn('✓', review)
+
+    def test_reversed_power_pin_still_gets_the_anomaly_marker(self):
+        review = self._review(
+            {'1': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'VCC_1'}})
+
+        self.assertIn('    pin1(VCC,pwr)=GND !!\n', review)
+
+    def test_power_pins_come_before_the_other_pins(self):
+        # PWR: が無くなった分、並び順が電源ピンを示す唯一の手がかりになる
+        review = self._review(
+            {'1': {'net': '/SW', 'pintype': 'output', 'pinfunction': 'SW_1'},
+             '2': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND_2'},
+             '3': {'net': 'Net-(X1-FB)', 'pintype': 'input', 'pinfunction': 'FB_3'}})
+        section = review[review.index('== INTERNAL COMPONENTS =='):]
+
+        self.assertIn('    pin2(GND,pwr)=GND\n'
+                      '    pin1(SW,out)=/SW\n'
+                      '    pin3(FB,in)=Net-(X1-FB)\n', section)
+
+
 class PurposeFieldTests(unittest.TestCase):
     """Purpose は「この回路で何のために使うか」という作成者の設計意図。
 
@@ -151,7 +286,7 @@ class PurposeFieldTests(unittest.TestCase):
 
         review = self._review(
             'J2', comp,
-            {'1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1'}})
+            {'1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1_1'}})
 
         self.assertIn('J2  Conn_01x10\n'
                       f'  Purpose: {self.PURPOSE}\n'
@@ -224,8 +359,10 @@ class FootprintTests(unittest.TestCase):
 
     def test_footprint_precedes_pin_lines(self):
         review = self._review(footprint='uchan:L_3.0x3.0mm_HandSolder')
+        # 凡例にも pin1 の記述があるので、部品一覧の中だけで前後を見る
+        section = review[review.index('== INTERNAL COMPONENTS =='):]
 
-        self.assertLess(review.index('Footprint:'), review.index('pin1('))
+        self.assertLess(section.index('Footprint:'), section.index('pin1'))
 
     def test_no_footprint_line_when_unset(self):
         self.assertNotIn('Footprint:', self._review(footprint=''))
@@ -455,6 +592,16 @@ class HeaderLineWrapTests(unittest.TestCase):
     トークンを無駄にするだけ。部品・ピン行の 2/4 スペースは階層を表すので別。
     """
 
+    def test_pin_annotation_rule_is_documented_outside_a_single_section(self):
+        """省略規則は両セクション共通なので、片方の節の説明に埋めない。"""
+        review = erc_export.format_review(
+            'board.kicad_sch', {}, {}, {}, set(), [])
+        header = review[:review.index('== AI REVIEW GUIDANCE ==')]
+        rule_line = next(l for l in header.splitlines() if 'pin1=' in l)
+
+        self.assertFalse(rule_line.lstrip().startswith('EXTERNAL INTERFACES'))
+        self.assertIn('passive', rule_line)
+
     def test_header_has_no_wrap_continuation_lines(self):
         review = erc_export.format_review(
             'board.kicad_sch', {}, {}, {}, set(), [])
@@ -479,11 +626,13 @@ class ExternalInterfaceTests(unittest.TestCase):
         'footprint': 'uchan:Grove_1x04_P2mm_THT_Horizontal',
         'manufacturer': '', 'manufacturer_pn': '',
     }
+    # KiCad 10 のネットリストは pinfunction を「ピン名_ピン番号」で出す。
+    # シンボル側のピン名は RX / VCC でも、ネットリストでは RX_1 / VCC_3 になる。
     GROVE_PINS = {
-        '1': {'net': 'Net-(J1-RX)', 'pintype': 'input', 'pinfunction': 'RX'},
-        '2': {'net': 'Net-(J1-TX)', 'pintype': 'output', 'pinfunction': 'TX'},
-        '3': {'net': 'VBUS', 'pintype': 'power_in', 'pinfunction': 'VCC'},
-        '4': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND'},
+        '1': {'net': 'Net-(J1-RX)', 'pintype': 'input', 'pinfunction': 'RX_1'},
+        '2': {'net': 'Net-(J1-TX)', 'pintype': 'output', 'pinfunction': 'TX_2'},
+        '3': {'net': 'VBUS', 'pintype': 'power_in', 'pinfunction': 'VCC_3'},
+        '4': {'net': 'GND', 'pintype': 'power_in', 'pinfunction': 'GND_4'},
     }
     HEADER = {
         'value': 'Conn_01x10', 'libpart': 'Conn_01x10', 'lib': 'Connector_Generic',
@@ -493,9 +642,9 @@ class ExternalInterfaceTests(unittest.TestCase):
         'manufacturer': '', 'manufacturer_pn': '',
     }
     HEADER_PINS = {
-        '1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1'},
-        '2': {'net': '/DCDC_IN', 'pintype': 'passive', 'pinfunction': 'Pin_2'},
-        '10': {'net': '/SW', 'pintype': 'passive', 'pinfunction': 'Pin_10'},
+        '1': {'net': 'VBUS', 'pintype': 'passive', 'pinfunction': 'Pin_1_1'},
+        '2': {'net': '/DCDC_IN', 'pintype': 'passive', 'pinfunction': 'Pin_2_2'},
+        '10': {'net': '/SW', 'pintype': 'passive', 'pinfunction': 'Pin_10_10'},
     }
     RESISTOR = {
         'value': '10k', 'libpart': 'R', 'lib': 'Device', 'description': 'Resistor',
@@ -582,7 +731,7 @@ class ExternalInterfaceTests(unittest.TestCase):
     def test_anomalous_power_pin_keeps_its_marker(self):
         pins = dict(self.GROVE_PINS,
                     **{'3': {'net': 'GND', 'pintype': 'power_in',
-                             'pinfunction': 'VCC'}})
+                             'pinfunction': 'VCC_3'}})
 
         review = self._review({'J1': self.GROVE}, {'J1': pins})
 

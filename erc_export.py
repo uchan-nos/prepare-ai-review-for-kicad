@@ -490,6 +490,20 @@ def _is_external_interface(ref, comp):
     return any(kw in text for kw in _CONNECTOR_KEYWORDS)
 
 
+def _pin_display_name(pinfunction, pin):
+    """表示用のピン名。末尾の冗長な "_ピン番号" を落とす。
+
+    KiCad 10 のネットリストは pinfunction を「ピン名_ピン番号」で出す
+    （シンボル側のピン名が RX / Pin_1 でも、ネットリストでは RX_1 / Pin_1_1）。
+    ピン行は pinN で始まるので、末尾の番号の繰り返しは何の情報も持たない。
+    番号が一致しない末尾（pin7 の "FB_3" など）は名前の一部なので残す。
+    """
+    suffix = f'_{pin.strip()}'
+    if pinfunction.endswith(suffix) and len(pinfunction) > len(suffix):
+        return pinfunction[:-len(suffix)]
+    return pinfunction
+
+
 # "Pin_1" / "Pad2" のようにピン番号を言い換えただけのピン名を見分ける
 _PIN_NUMBER_ALIAS_RE = re.compile(r'^(?:pin|pad|p)?[_\-\s]?0*(\d+)$', re.IGNORECASE)
 
@@ -499,20 +513,29 @@ def _is_pin_number_restated(pinfunction, pin):
     return bool(m) and m.group(1) == pin.strip().lstrip('0')
 
 
-def _iface_pin_annotation(pin, info):
-    """外部インターフェースのピン行に付ける "(機能,型)"。情報が無ければ空。
+def _informative_pin_name(pinfunction, pin):
+    """情報を持つピン名だけを返す。空、またはピン番号の言い換えなら空文字列。"""
+    pf = _pin_display_name((pinfunction or '').strip(), pin)
+    return '' if not pf or _is_pin_number_restated(pf, pin) else pf
 
-    汎用ピンヘッダは pinfunction が "Pin_1"、pintype が passive で、どちらも
-    ピン番号以上のことを言わない。そういうピンは注記を付けず pin1=NET と出す。
+
+def _pin_annotation(pin, info):
+    """ピン行に付ける "(ピン名,ピンタイプ)"。語ることが無ければ空文字列。
+
+    括弧の有無を情報の有無に一致させる。汎用ピンヘッダは pinfunction が
+    "Pin_1"、pintype が passive で、どちらもピン番号以上のことを言わないので
+    注記ごと省いて pin1=NET と出す。括弧が無いピンは passive（または
+    unspecified）だと読み手が復元できる。
+
+    括弧を出すときは必ず 2 項目そろえる。(K) や (in) のような片方だけの形を
+    混ぜると、読み手が括弧を見るたびに「今どちらが入っているのか」を
+    判定することになり、括弧 1 個分の節約に見合わない。
     """
-    parts = []
-    pf = (info.get('pinfunction') or '').strip()
-    if pf and not _is_pin_number_restated(pf, pin):
-        parts.append(pf)
+    name = _informative_pin_name(info.get('pinfunction'), pin)
     pintype = info.get('pintype', '')
-    if pintype not in ('', 'passive', 'unspecified'):
-        parts.append(_pt_short(pintype))
-    return f'({",".join(parts)})' if parts else ''
+    if not name and pintype in ('', 'passive', 'unspecified'):
+        return ''
+    return f'({name},{_pt_short(pintype)})'
 
 
 def _erc_violations(erc_data):
@@ -571,8 +594,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         'セクション構成:',
         '  ANOMALIES — ネットリスト解析による疑わしい接続の自動検出（人間のレビューが必要）。デカップリングコンデンサ、プルダウン抵抗、直列フェライト等の正常な構成は意図的に検出対象外。ここに出ないことは正常の裏付けではない。',
         '  ERC RESULTS — KiCad の Electrical Rules Check（電気的規則検査）結果 JSON。件数は全シートの合計。回路図側で除外された違反は excluded として別計上。無効化されたチェックがあれば件数の直後に列挙する。',
-        '  EXTERNAL INTERFACES — 回路と外部との境界（コネクタ・テストポイント類）とその接続。ピンは番号順に並べ、電源ピンも信号ピンと同じ並びのまま記載する（コネクタは物理的なピン並びが本質のため）。ピン名がピン番号の言い換え（Pin_1 等）で pintype も passive の場合は、注記を省いて pin1=NET と書く。内部部品と外部インターフェースの振り分けは Library Symbol（lib / part / description）と ref からの自動判定であり、誤りうる。部品名を見て境界かどうかを確認すること。',
-        '  INTERNAL COMPONENTS — 回路内部の部品一覧とピン接続（電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
+        '  EXTERNAL INTERFACES — 回路と外部との境界（コネクタ・テストポイント類）とその接続。ピンは番号順に並べ、電源ピンも信号ピンと同じ並びのまま記載する（コネクタは物理的なピン並びが本質のため）。内部部品と外部インターフェースの振り分けは Library Symbol（lib / part / description）と ref からの自動判定であり、誤りうる。部品名を見て境界かどうかを確認すること。',
+        '  INTERNAL COMPONENTS — 回路内部の部品一覧とピン接続',
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）。外部インターフェースのピンも含む',
         '',
         '部品の属性（EXTERNAL INTERFACES と INTERNAL COMPONENTS で共通。回路図に設定がある部品のみ 1 行ずつ記載し、未設定なら行ごと省略する。値は KiCad のものそのまま）:',
@@ -582,6 +605,9 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '  Manufacturer — 部品のメーカー名',
         '  Manufacturer PN — 部品のメーカー型番',
         '',
+        'ピン行の表記（両セクション共通）: pin<番号>(ピン名,ピンタイプ)=ネット名。括弧の中は必ず「ピン名,ピンタイプ」の 2 項目で、片方だけの形は使わない。ピン名がピン番号の言い換え（Pin_1 等）のときは名前の欄を空にする（例 pin1(,in)=ネット名）。ピン名も型も語ることが無いピン、すなわち名前が番号の言い換えで型が passive / unspecified のピンは、括弧ごと省いて pin1=ネット名 と書く。したがって括弧が無いピンは passive（または unspecified）である。',
+        '電源ピン（power_in / power_out）の行も書式は同じで、電源ピンであることは注記の pwr が示す。INTERNAL COMPONENTS ではその部品のピンのうち電源ピンを先に置く。EXTERNAL INTERFACES では並べ替えず、コネクタのピン番号順のまま置く。',
+        'ネット名の後ろの !! は、電源の逆接続や出力の電源ネット直結など、ツールが疑わしいと判断した接続を指す（詳細は ANOMALIES）。印が無いことは検査して正常だったことを意味しない。',
         'ピンタイプ略称: pwr=電源, in=入力, out=出力, bi=双方向, tri=3ステート, pas=パッシブ',
         '',
         '== AI REVIEW GUIDANCE ==',
@@ -663,7 +689,7 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
                     lines.append(f'  {label}: {comp[key]}')
             for pin, info in sorted(pins_by_comp.get(ref, {}).items(),
                                     key=_pin_num_key):
-                annotation = _iface_pin_annotation(pin, info)
+                annotation = _pin_annotation(pin, info)
                 lines.append(
                     f'  pin{pin}{annotation}={info["net"]}{pin_flag(info)}')
     else:
@@ -696,6 +722,8 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
                     lines.append(f'    {label}: {comp[key]}')
             pins = pins_by_comp.get(ref, {})
 
+            # 電源ピンを先に置く。ピン行の書式は他のピンと同じで、
+            # 電源ピンであることは注記の pwr が示す
             pwr_pins = sorted(
                 [(p, i) for p, i in pins.items()
                  if i.get('pintype') in ('power_in', 'power_out')],
@@ -705,19 +733,13 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
                  if i.get('pintype') not in ('power_in', 'power_out')],
                 key=_pin_num_key)
 
-            if pwr_pins:
-                parts = []
-                for pn, info in pwr_pins:
-                    marker = pin_flag(info) if pin_flag(info) else ' ✓'
-                    pf = info.get('pinfunction', '')
-                    parts.append(f'pin{pn}({pf})→{info["net"]}{marker}')
-                lines.append(f'    PWR: {" ".join(parts)}')
+            for pn, info in pwr_pins:
+                lines.append(f'    pin{pn}{_pin_annotation(pn, info)}='
+                             f'{info["net"]}{pin_flag(info)}')
 
             for pn, info in sig_pins:
-                flag = pin_flag(info)
-                pf = info.get('pinfunction', '')
-                pt = _pt_short(info.get('pintype', ''))
-                lines.append(f'    pin{pn}({pf},{pt})={info["net"]}{flag}')
+                lines.append(f'    pin{pn}{_pin_annotation(pn, info)}='
+                             f'{info["net"]}{pin_flag(info)}')
 
     lines.append('')
 
