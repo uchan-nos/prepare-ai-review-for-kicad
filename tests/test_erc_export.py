@@ -106,10 +106,12 @@ class ReviewFormattingTests(unittest.TestCase):
 class ErcViolationCountTests(unittest.TestCase):
     """kicad-cli の ERC JSON は違反を sheets[].violations に入れる。"""
 
-    def _header(self, erc_data):
-        review = erc_export.format_review(
+    def _review(self, erc_data):
+        return erc_export.format_review(
             'board.kicad_sch', {}, {}, {}, set(), [], erc_data=erc_data)
-        for line in review.splitlines():
+
+    def _header(self, erc_data):
+        for line in self._review(erc_data).splitlines():
             if line.startswith('== ERC RESULTS =='):
                 return line
         self.fail('ERC RESULTS セクションが無い')
@@ -146,6 +148,54 @@ class ErcViolationCountTests(unittest.TestCase):
     def test_no_violations_reports_zero(self):
         self.assertEqual(self._header({'sheets': [{'path': '/', 'violations': []}]}),
                          '== ERC RESULTS == (0 error(s), 0 warning(s))')
+
+
+class ErcIgnoredCheckTests(unittest.TestCase):
+    """無効化された ERC チェックはサマリから見えないと、0 件を過信させる。"""
+
+    IGNORED = [
+        {'key': 'single_global_label',
+         'description': 'Global label only appears once in the schematic'},
+        {'key': 'four_way_junction',
+         'description': 'Four connection points are joined together'},
+    ]
+
+    def _review(self, erc_data):
+        return erc_export.format_review(
+            'board.kicad_sch', {}, {}, {}, set(), [], erc_data=erc_data)
+
+    def _header(self, erc_data):
+        for line in self._review(erc_data).splitlines():
+            if line.startswith('== ERC RESULTS =='):
+                return line
+        self.fail('ERC RESULTS セクションが無い')
+
+    def test_header_reports_ignored_check_count(self):
+        header = self._header({'sheets': [], 'ignored_checks': self.IGNORED})
+
+        self.assertEqual(header,
+                         '== ERC RESULTS == (0 error(s), 0 warning(s), 2 checks ignored)')
+
+    def test_ignored_checks_are_listed_with_key_and_description(self):
+        review = self._review({'sheets': [], 'ignored_checks': self.IGNORED})
+
+        self.assertIn(
+            '  - single_global_label: Global label only appears once in the schematic',
+            review)
+        self.assertIn(
+            '  - four_way_junction: Four connection points are joined together', review)
+
+    def test_ignored_list_precedes_the_json_block(self):
+        review = self._review({'sheets': [], 'ignored_checks': self.IGNORED})
+
+        self.assertLess(review.index('single_global_label'), review.index('```json'))
+
+    def test_nothing_added_when_no_checks_are_ignored(self):
+        for erc_data in ({'sheets': []}, {'sheets': [], 'ignored_checks': []}):
+            with self.subTest(erc_data=erc_data):
+                self.assertEqual(self._header(erc_data),
+                                 '== ERC RESULTS == (0 error(s), 0 warning(s))')
+                self.assertNotIn('無効化された ERC チェック (', self._review(erc_data))
 
 
 class TwoPinPowerAnomalyTests(unittest.TestCase):

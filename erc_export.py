@@ -507,6 +507,7 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         '                正常な構成は意図的に検出対象外。ここに出ないことは正常の裏付けではない。',
         '  ERC RESULTS — KiCad の Electrical Rules Check（電気的規則検査）結果 JSON',
         '                件数は全シートの合計。回路図側で除外された違反は excluded として別計上。',
+        '                無効化されたチェックがあれば件数の直後に列挙する。',
         '  COMPONENTS  — コンポーネント一覧とピン接続（電源ピンに ✓=正常 / !!=異常 のマーカー付き）',
         '  SIGNAL NETS — 信号ネット一覧（電源ネットを除く）',
         '',
@@ -531,10 +532,20 @@ def format_review(source_file, components, pins_by_comp, nets, power_nets, anoma
         lines.append('')
     elif erc_data is not None:
         n_err, n_warn, n_excl = _count_violations(erc_data)
+        ignored = erc_data.get('ignored_checks') or []
         counts = f'{n_err} error(s), {n_warn} warning(s)'
         if n_excl:
             counts += f', {n_excl} excluded'
+        if ignored:
+            counts += f', {len(ignored)} checks ignored'
         lines.append(f'== ERC RESULTS == ({counts})')
+        if ignored:
+            # 無効化されたチェックは JSON 末尾に埋もれるため、件数の直後に明示する。
+            # これを知らないと「0 error」を検査済みの裏付けと誤解しかねない。
+            lines.append(f'無効化された ERC チェック ({len(ignored)} 件) '
+                         '— この種類の違反は上の件数に含まれない:')
+            for chk in ignored:
+                lines.append(f'  - {chk.get("key", "")}: {chk.get("description", "")}')
         lines.append('```json')
         lines.append(json.dumps(erc_data, ensure_ascii=False, indent=2))
         lines.append('```')
@@ -680,6 +691,10 @@ def main():
             errors   = [v for v in violations if v.get('severity') == 'error']
             warnings = [v for v in violations if v.get('severity') == 'warning']
             _log(f'ERC: {len(errors)} error(s), {len(warnings)} warning(s)')
+            ignored = erc_data.get('ignored_checks') or []
+            if ignored:
+                _log(f'ERC: {len(ignored)} checks ignored: '
+                     + ', '.join(c.get('key', '') for c in ignored))
             for v in errors:
                 _log(f'  error: {v.get("description", "")}')
             for v in warnings:
